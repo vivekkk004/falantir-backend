@@ -1,0 +1,12 @@
+ultralytics==8.0.136
+numpy==1.24.3
+imutils==0.5.4
+opencv-python==4.8.0.74
+fastapi==0.115.0
+uvicorn[standard]==0.31.0
+python-jose[cryptography]==3.3.0
+bcrypt==4.2.1
+motor==3.6.0
+python-multipart==0.0.12
+pydantic[email-validation]==2.9.2
+email-validator==2.2.0
