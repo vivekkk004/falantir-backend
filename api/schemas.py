@@ -10,6 +10,7 @@ class RegisterRequest(BaseModel):
     name: str
     email: EmailStr
     password: str
+    phone: Optional[str] = None
 
 
 class LoginRequest(BaseModel):
@@ -29,6 +30,7 @@ class UserResponse(BaseModel):
     id: Optional[str] = None
     name: str
     email: str
+    phone: Optional[str] = None
     role: str = "user"
     is_active: bool = True
     created_at: Optional[datetime] = None
@@ -43,6 +45,7 @@ def user_to_response(user: dict) -> "UserResponse":
         id=str(user.get("_id", "")),
         name=user.get("name", ""),
         email=user.get("email", ""),
+        phone=user.get("phone"),
         role=user.get("role", "user"),
         is_active=user.get("is_active", True),
         created_at=user.get("created_at"),
@@ -52,6 +55,7 @@ def user_to_response(user: dict) -> "UserResponse":
 class UserUpdateRequest(BaseModel):
     name: Optional[str] = None
     email: Optional[EmailStr] = None
+    phone: Optional[str] = None
 
 
 class MessageResponse(BaseModel):

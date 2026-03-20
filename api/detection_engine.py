@@ -6,7 +6,8 @@ import cv2
 import numpy as np
 from datetime import datetime, timezone
 from collections import deque
-from api.database import alerts_collection
+from api.database import alerts_collection, users_collection
+from api.notifications import notify_all
 import asyncio
 
 # Attempt imports for YOLO
@@ -53,6 +54,24 @@ def _make_placeholder(msg="Connecting...") -> bytes:
     cv2.putText(img, msg, (50, 180), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (150, 150, 150), 2)
     return _encode_jpeg(img)
 
+async def _notify_users_async(alert_data):
+    """Fetch users and notify them about the detection."""
+    try:
+        msg = (
+            f"SECURITY ALERT: {alert_data.get('status')} detected on camera {alert_data.get('camera_label') or 'unknown'}. "
+            f"Confidence: {alert_data.get('confidence')}%"
+        )
+        # Fetch all active users
+        results = await users_collection.find({"is_active": True}).to_list(length=100)
+        
+        for user in results:
+            email = user.get("email")
+            phone = user.get("phone")
+            if email or phone:
+                notify_all(email, phone, msg)
+    except Exception as e:
+        print(f"NOTIFICATION ERROR: {e}")
+
 def _save_alert_to_db(alert_data):
     try:
         loop = asyncio.new_event_loop()
@@ -63,7 +82,13 @@ def _save_alert_to_db(alert_data):
         if isinstance(db_data.get("timestamp"), str):
             db_data["timestamp"] = datetime.fromisoformat(db_data["timestamp"])
         
+        # Save to database
         loop.run_until_complete(alerts_collection.insert_one(db_data))
+        
+        # Trigger notifications if shoplifting
+        if db_data.get("status") == "Shoplifting":
+            loop.run_until_complete(_notify_users_async(db_data))
+            
         loop.close()
     except Exception as e:
         print(f"ALERTS-DB ERROR: {e}")

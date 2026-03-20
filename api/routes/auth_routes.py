@@ -24,6 +24,7 @@ async def register(request: RegisterRequest):
         user_doc = {
             "name": request.name,
             "email": request.email,
+            "phone": request.phone,
             "hashed_password": hash_password(request.password),
             "role": "user",
             "is_active": True,
