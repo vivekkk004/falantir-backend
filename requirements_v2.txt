@@ -1,0 +1,43 @@
+# Falantir v2 — Dependencies
+
+# Core Framework
+flask==3.1.0
+flask-cors==5.0.1
+flask-socketio==5.4.1
+
+# WebSocket transport
+gevent-websocket==0.10.1
+simple-websocket==1.1.0
+
+# AI / ML
+ultralytics==8.0.136
+torch>=2.0.0
+torchvision>=0.15.0
+google-generativeai==0.8.0
+
+# Computer Vision
+opencv-python==4.8.0.74
+numpy==1.24.3
+imutils==0.5.4
+
+# Database
+pymongo==4.10.1
+
+# Authentication
+python-jose[cryptography]==3.3.0
+bcrypt==4.2.1
+
+# Notifications
+twilio==8.1.0
+
+# Utilities
+python-dotenv==1.0.1
+python-multipart==0.0.12
+pydantic[email-validation]==2.9.2
+email-validator==2.2.0
+huggingface-hub==0.25.0
+
+# Legacy (v1 FastAPI — still available)
+fastapi==0.115.0
+uvicorn[standard]==0.31.0
+motor==3.6.0
