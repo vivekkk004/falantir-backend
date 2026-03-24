@@ -1,0 +1,45 @@
+services:
+  - type: web
+    name: falantir-backend
+    env: python
+    region: singapore  # closest to India
+    plan: free
+    buildCommand: pip install -r requirements_v2.txt
+    startCommand: gunicorn --worker-class eventlet -w 1 --bind 0.0.0.0:$PORT app:app
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.10.0
+      - key: FLASK_DEBUG
+        value: false
+      - key: MONGO_URI
+        sync: false   # Set this manually in Render dashboard
+      - key: FLASK_SECRET_KEY
+        generateValue: true
+      - key: CORS_ORIGINS
+        sync: false   # Set to your frontend URL in Render dashboard
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+      - key: TWILIO_PHONE_NUMBER
+        sync: false
+      - key: ALERT_TO_NUMBER
+        sync: false
+      - key: SMTP_SERVER
+        value: smtp.gmail.com
+      - key: SMTP_PORT
+        value: "587"
+      - key: SMTP_USER
+        sync: false
+      - key: SMTP_PASS
+        sync: false
+      - key: FROM_EMAIL
+        sync: false
+      - key: MAX_CAMERAS
+        value: "2"
+      - key: FRAME_SKIP
+        value: "3"
+      - key: THREAT_THRESHOLD
+        value: "0.6"
