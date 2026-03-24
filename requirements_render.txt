@@ -31,7 +31,7 @@ imutils==0.5.4
 google-generativeai==0.8.0
 
 # ── Database ────────────────────────────────────────────────
-pymongo==4.10.1
+pymongo==4.9.2
 
 # ── Authentication ──────────────────────────────────────────
 python-jose[cryptography]==3.3.0
