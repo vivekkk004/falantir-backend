@@ -23,7 +23,17 @@ from flask_socketio import SocketIO, join_room, leave_room
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.getenv("FLASK_SECRET_KEY", "falantir-change-this-in-production")
 
-CORS(app, origins=os.getenv("CORS_ORIGINS", "*").split(","), supports_credentials=True)
+# Parse CORS origins — strip spaces so "http://a.com, http://b.com" works correctly
+_raw_origins = os.getenv("CORS_ORIGINS", "*")
+_cors_origins = [o.strip() for o in _raw_origins.split(",")] if _raw_origins != "*" else "*"
+
+CORS(
+    app,
+    origins=_cors_origins,
+    supports_credentials=True,
+    allow_headers=["Content-Type", "Authorization", "X-Requested-With"],
+    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+)
 
 # Use eventlet when running under gunicorn (Render) for proper WebSocket support.
 # Fall back to threading for local dev (python app.py).
@@ -31,7 +41,7 @@ _async_mode = "eventlet" if os.getenv("SERVER_SOFTWARE", "").startswith("gunicor
 
 socketio = SocketIO(
     app,
-    cors_allowed_origins=os.getenv("CORS_ORIGINS", "*").split(","),
+    cors_allowed_origins=_cors_origins,
     async_mode=_async_mode,
 )
 
@@ -57,6 +67,21 @@ def root():
 @app.route("/api/health")
 def health():
     return jsonify({"status": "healthy", "version": "2.0.0"})
+
+
+# ─── Global OPTIONS handler (CORS Preflight) ─────────────
+# Explicitly handle all OPTIONS requests so preflight never returns 5xx.
+@app.route("/", defaults={"path": ""}, methods=["OPTIONS"])
+@app.route("/<path:path>", methods=["OPTIONS"])
+def handle_options(path):
+    from flask import make_response
+    response = make_response()
+    response.headers["Access-Control-Allow-Origin"] = request.headers.get("Origin", "*")
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With"
+    response.headers["Access-Control-Allow-Credentials"] = "true"
+    response.headers["Access-Control-Max-Age"] = "86400"
+    return response, 200
 
 
 # ─── WebSocket Events ────────────────────────────────────
@@ -107,9 +132,13 @@ def init_app():
 
 # ─── Gunicorn entry-point ────────────────────────────────
 # Gunicorn never executes the __main__ block, so we initialise here.
-# Guard prevents double-init when running via `python app.py`.
+# Wrapped in try/except so model failures don't crash the whole server (which causes 502).
 if os.getenv("SERVER_SOFTWARE", "").startswith("gunicorn"):
-    init_app()
+    try:
+        init_app()
+    except Exception as _startup_err:
+        print(f"STARTUP WARNING: init_app() failed — {_startup_err}")
+        print("  Server will still serve requests but AI models may be unavailable.")
 
 # Alias expected by gunicorn: `gunicorn app:app`
 application = app
