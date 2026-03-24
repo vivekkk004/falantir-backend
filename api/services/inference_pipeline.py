@@ -9,40 +9,37 @@ as fast as the slowest model.
 import os
 import threading
 import time
+import functools
 import cv2
 import numpy as np
 from dotenv import load_dotenv
 
 load_dotenv()
 
+# ─── PyTorch 2.6+ Compatibility Patch ────────────────────
+# PyTorch 2.6 changed weights_only default to True, which blocks
+# loading Ultralytics models. We patch torch.load to restore the
+# previous default (False) since we trust our own model files.
+try:
+    import torch
+    _original_torch_load = torch.load
+
+    @functools.wraps(_original_torch_load)
+    def _patched_torch_load(*args, **kwargs):
+        if "weights_only" not in kwargs:
+            kwargs["weights_only"] = False
+        return _original_torch_load(*args, **kwargs)
+
+    torch.load = _patched_torch_load
+    print("TORCH: Patched torch.load to default weights_only=False")
+except Exception as e:
+    print(f"TORCH: Could not patch torch.load — {e}")
+
 # ─── YOLO Setup ───────────────────────────────────────────
 
 try:
     from ultralytics import YOLO
     _HAS_YOLO = True
-    
-    # Register safe globals for PyTorch 2.6+ (required for unpickling models)
-    try:
-        import torch
-        if hasattr(torch.serialization, 'add_safe_globals'):
-            import torch.nn
-            import ultralytics.nn.tasks
-            
-            # Allowlist both Ultralytics and core Torch containers
-            safe_classes = [
-                ultralytics.nn.tasks.DetectionModel,
-                torch.nn.modules.container.Sequential,
-                torch.nn.modules.linear.Linear,
-                torch.nn.modules.activation.ReLU,
-                torch.nn.modules.batchnorm.BatchNorm2d,
-                torch.nn.modules.pooling.AdaptiveAvgPool2d,
-                torch.nn.modules.dropout.Dropout,
-                torch.nn.modules.activation.Sigmoid,
-            ]
-            torch.serialization.add_safe_globals(safe_classes)
-            print("TORCH: Registered all model classes as safe globals")
-    except Exception as e:
-        print(f"TORCH: Failed to register safe globals: {e}")
 except ImportError:
     _HAS_YOLO = False
 
