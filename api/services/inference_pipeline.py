@@ -20,6 +20,16 @@ load_dotenv()
 try:
     from ultralytics import YOLO
     _HAS_YOLO = True
+    
+    # Register Ultralytics classes as safe globals for PyTorch 2.6+
+    try:
+        import torch
+        if hasattr(torch.serialization, 'add_safe_globals'):
+            import ultralytics.nn.tasks
+            torch.serialization.add_safe_globals([ultralytics.nn.tasks.DetectionModel])
+            print("TORCH: Registered Ultralytics classes as safe globals")
+    except Exception as e:
+        print(f"TORCH: Failed to register safe globals: {e}")
 except ImportError:
     _HAS_YOLO = False
 

@@ -46,6 +46,7 @@ python-multipart==0.0.12
 pydantic[email-validation]==2.9.2
 email-validator==2.2.0
 huggingface-hub==0.25.0
+certifi>=2024.0.0
 
 # ── Legacy v1 (FastAPI still imported in codebase) ──────────
 fastapi==0.115.0

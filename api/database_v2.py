@@ -23,8 +23,16 @@ def get_db():
     """Get the database instance, connecting if needed."""
     global _client, _db
     if _db is None:
-        _client = MongoClient(MONGO_URI)
-        _db = _client[DATABASE_NAME]
+        import certifi
+        ca = certifi.where()
+        try:
+            _client = MongoClient(MONGO_URI, tlsCAFile=ca)
+            # Trigger a ping to verify connection immediately
+            _client.admin.command('ping')
+            _db = _client[DATABASE_NAME]
+        except Exception as e:
+            print(f"DATABASE CONNECTION ERROR: {e}")
+            raise e
     return _db
 
 
