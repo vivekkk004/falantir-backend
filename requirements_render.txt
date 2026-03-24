@@ -17,8 +17,8 @@ eventlet==0.38.2
 # ── AI / ML ─────────────────────────────────────────────────
 # CPU-only torch — avoids 2 GB+ CUDA build
 --extra-index-url https://download.pytorch.org/whl/cpu
-torch==2.2.2+cpu
-torchvision==0.17.2+cpu
+torch>=2.0.0
+torchvision>=0.15.0
 ultralytics==8.0.136
 
 # ── Computer Vision ─────────────────────────────────────────
