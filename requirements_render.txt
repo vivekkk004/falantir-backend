@@ -1,0 +1,53 @@
+# Falantir v2 — Render-optimised dependencies
+# Python 3.11.9 (set in runtime.txt)
+
+# ── Build tools (must be first) ─────────────────────────────
+setuptools>=68.0.0
+wheel>=0.43.0
+
+# ── Core Framework ──────────────────────────────────────────
+flask==3.1.0
+flask-cors==5.0.1
+flask-socketio==5.4.1
+
+# ── WSGI / WebSocket server ─────────────────────────────────
+gunicorn==23.0.0
+eventlet==0.38.2
+
+# ── AI / ML ─────────────────────────────────────────────────
+# CPU-only torch — avoids 2 GB+ CUDA build
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.2.2+cpu
+torchvision==0.17.2+cpu
+ultralytics==8.0.136
+
+# ── Computer Vision ─────────────────────────────────────────
+# Headless variant: no libGL / GUI deps needed on Linux servers
+opencv-python-headless==4.8.1.78
+numpy>=1.24.3,<2.0.0
+imutils==0.5.4
+
+# ── Generative AI ───────────────────────────────────────────
+google-generativeai==0.8.0
+
+# ── Database ────────────────────────────────────────────────
+pymongo==4.10.1
+
+# ── Authentication ──────────────────────────────────────────
+python-jose[cryptography]==3.3.0
+bcrypt==4.2.1
+
+# ── Notifications ───────────────────────────────────────────
+twilio==8.1.0
+
+# ── Utilities ───────────────────────────────────────────────
+python-dotenv==1.0.1
+python-multipart==0.0.12
+pydantic[email-validation]==2.9.2
+email-validator==2.2.0
+huggingface-hub==0.25.0
+
+# ── Legacy v1 (FastAPI still imported in codebase) ──────────
+fastapi==0.115.0
+uvicorn[standard]==0.31.0
+motor==3.6.0

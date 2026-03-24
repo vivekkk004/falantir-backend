@@ -25,10 +25,14 @@ app.config["SECRET_KEY"] = os.getenv("FLASK_SECRET_KEY", "falantir-change-this-i
 
 CORS(app, origins=os.getenv("CORS_ORIGINS", "*").split(","), supports_credentials=True)
 
+# Use eventlet when running under gunicorn (Render) for proper WebSocket support.
+# Fall back to threading for local dev (python app.py).
+_async_mode = "eventlet" if os.getenv("SERVER_SOFTWARE", "").startswith("gunicorn") else "threading"
+
 socketio = SocketIO(
     app,
     cors_allowed_origins=os.getenv("CORS_ORIGINS", "*").split(","),
-    async_mode="threading",
+    async_mode=_async_mode,
 )
 
 # ─── Register Blueprints ─────────────────────────────────
@@ -82,7 +86,6 @@ def handle_leave_agent(data):
         leave_room(agent_id)
         print(f"WS: Client left room {agent_id}")
 
-
 # ─── Startup ─────────────────────────────────────────────
 
 def init_app():
@@ -100,6 +103,16 @@ def init_app():
     print("=" * 50)
     print("  System ready")
     print("=" * 50)
+
+
+# ─── Gunicorn entry-point ────────────────────────────────
+# Gunicorn never executes the __main__ block, so we initialise here.
+# Guard prevents double-init when running via `python app.py`.
+if os.getenv("SERVER_SOFTWARE", "").startswith("gunicorn"):
+    init_app()
+
+# Alias expected by gunicorn: `gunicorn app:app`
+application = app
 
 
 if __name__ == "__main__":
