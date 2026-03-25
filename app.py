@@ -130,17 +130,25 @@ def init_app():
     print("=" * 50)
 
 
-# ─── Gunicorn entry-point ────────────────────────────────
-# Gunicorn never executes the __main__ block, so we initialise here.
-# Wrapped in try/except so model failures don't crash the whole server (which causes 502).
-if os.getenv("SERVER_SOFTWARE", "").startswith("gunicorn"):
-    try:
-        init_app()
-    except Exception as _startup_err:
-        print(f"STARTUP WARNING: init_app() failed — {_startup_err}")
-        print("  Server will still serve requests but AI models may be unavailable.")
+# ─── One-time initialisation on first request ────────────
+# NOTE: os.getenv("SERVER_SOFTWARE") does NOT work for gunicorn detection —
+# SERVER_SOFTWARE is a WSGI per-request variable, not an OS env var.
+# We use before_request so the server always starts cleanly (avoids 502),
+# then initialises DB + models on the very first request.
+_app_initialized = False
 
-# Alias expected by gunicorn: `gunicorn app:app`
+@app.before_request
+def _lazy_init():
+    global _app_initialized
+    if not _app_initialized:
+        _app_initialized = True
+        try:
+            init_app()
+        except Exception as err:
+            print(f"STARTUP WARNING: init_app() error — {err}")
+            print("  API will still serve requests; AI models may be unavailable.")
+
+# Alias for gunicorn: `gunicorn app:app`
 application = app
 
 
