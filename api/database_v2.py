@@ -27,9 +27,8 @@ def get_db():
         ca = certifi.where()
         try:
             _client = MongoClient(MONGO_URI, tlsCAFile=ca)
-            # Trigger a ping to verify connection immediately
-            _client.admin.command('ping')
             _db = _client[DATABASE_NAME]
+            print(f"DATABASE: Client created for {DATABASE_NAME}")
         except Exception as e:
             print(f"DATABASE CONNECTION ERROR: {e}")
             raise e
