@@ -14,7 +14,7 @@ load_dotenv()
 # Ensure project root is in path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 from flask_cors import CORS
 from flask_socketio import SocketIO, join_room, leave_room
 
@@ -37,7 +37,7 @@ CORS(
 
 # Use eventlet when running under gunicorn (Render) for proper WebSocket support.
 # Fall back to threading for local dev (python app.py).
-_async_mode = "eventlet" if os.getenv("SERVER_SOFTWARE", "").startswith("gunicorn") else "threading"
+_async_mode = "threading"
 
 socketio = SocketIO(
     app,
@@ -69,8 +69,22 @@ def health():
     return jsonify({"status": "healthy", "version": "2.0.0"})
 
 
+# ─── Force CORS on ALL responses (incl. 500 errors) ─────
+# Flask-CORS skips error responses by default — so a 500 appears to
+# the browser as a CORS error even though it's really a server error.
+@app.after_request
+def _force_cors(response):
+    origin = request.headers.get("Origin", "")
+    allowed = _cors_origins
+    if allowed == "*" or origin in (allowed if isinstance(allowed, list) else [allowed]):
+        response.headers["Access-Control-Allow-Origin"] = origin or "*"
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With"
+    return response
+
+
 # ─── Global OPTIONS handler (CORS Preflight) ─────────────
-# Explicitly handle all OPTIONS requests so preflight never returns 5xx.
 @app.route("/", defaults={"path": ""}, methods=["OPTIONS"])
 @app.route("/<path:path>", methods=["OPTIONS"])
 def handle_options(path):
@@ -111,30 +125,36 @@ def handle_leave_agent(data):
         leave_room(agent_id)
         print(f"WS: Client left room {agent_id}")
 
+
 # ─── Startup ─────────────────────────────────────────────
 
 def init_app():
-    """Initialize database and load all models on startup."""
-    from api.database_v2 import init_db
-    from api.services.inference_pipeline import load_all_models
-
+    """Initialize app: DB first (critical), then AI models (optional)."""
     print("=" * 50)
     print("  FALANTIR v2 — Autonomous AI Security Agent")
     print("=" * 50)
 
+    # Critical: database must connect
+    from api.database_v2 import init_db
     init_db()
-    load_all_models()
+
+    # Optional: AI models — failures are non-fatal
+    try:
+        from api.services.inference_pipeline import load_all_models
+        load_all_models()
+    except Exception as model_err:
+        print(f"MODEL LOAD WARNING: {model_err}")
+        print("  AI features disabled; auth/user routes still work normally.")
 
     print("=" * 50)
     print("  System ready")
     print("=" * 50)
 
 
-# ─── One-time initialisation on first request ────────────
-# NOTE: os.getenv("SERVER_SOFTWARE") does NOT work for gunicorn detection —
-# SERVER_SOFTWARE is a WSGI per-request variable, not an OS env var.
-# We use before_request so the server always starts cleanly (avoids 502),
-# then initialises DB + models on the very first request.
+# ─── One-time lazy init on first request ─────────────────
+# SERVER_SOFTWARE is a WSGI per-request variable — NOT an OS env var.
+# Using before_request ensures the server always starts cleanly (no 502),
+# and initialises DB + models on the very first real request.
 _app_initialized = False
 
 @app.before_request
@@ -145,8 +165,8 @@ def _lazy_init():
         try:
             init_app()
         except Exception as err:
-            print(f"STARTUP WARNING: init_app() error — {err}")
-            print("  API will still serve requests; AI models may be unavailable.")
+            print(f"STARTUP ERROR: {err}")
+            print("  Some routes may fail until DB is reachable.")
 
 # Alias for gunicorn: `gunicorn app:app`
 application = app
