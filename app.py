@@ -23,9 +23,20 @@ from flask_socketio import SocketIO, join_room, leave_room
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.getenv("FLASK_SECRET_KEY", "falantir-change-this-in-production")
 
-# Parse CORS origins — strip spaces so "http://a.com, http://b.com" works correctly
-_raw_origins = os.getenv("CORS_ORIGINS", "*")
-_cors_origins = [o.strip() for o in _raw_origins.split(",")] if _raw_origins != "*" else "*"
+# ─── CORS ─────────────────────────────────────────────────
+# Parse CORS_ORIGINS from env. Support:
+#   "*"                                    → allow everything (dev)
+#   "http://a.com,http://b.com"            → explicit allowlist
+#   unset                                  → sensible local defaults
+_raw_origins = os.getenv("CORS_ORIGINS", "").strip()
+if _raw_origins == "" or _raw_origins == "*":
+    _cors_origins = "*"
+    _cors_origins_set = None
+else:
+    _cors_origins = [o.strip() for o in _raw_origins.split(",") if o.strip()]
+    _cors_origins_set = set(_cors_origins)
+
+print(f"CORS: allowed origins = {_cors_origins}")
 
 CORS(
     app,
@@ -72,15 +83,27 @@ def health():
 # ─── Force CORS on ALL responses (incl. 500 errors) ─────
 # Flask-CORS skips error responses by default — so a 500 appears to
 # the browser as a CORS error even though it's really a server error.
+#
+# Logic:
+#   - If CORS_ORIGINS is "*" (or unset), echo any Origin header we see.
+#   - Otherwise, only echo Origin when it's in our allowlist.
+#   - Always set the other CORS headers so preflights work.
 @app.after_request
 def _force_cors(response):
     origin = request.headers.get("Origin", "")
-    allowed = _cors_origins
-    if allowed == "*" or origin in (allowed if isinstance(allowed, list) else [allowed]):
-        response.headers["Access-Control-Allow-Origin"] = origin or "*"
-        response.headers["Access-Control-Allow-Credentials"] = "true"
-        response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
-        response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With"
+
+    if origin:
+        if _cors_origins == "*" or (_cors_origins_set and origin in _cors_origins_set):
+            response.headers["Access-Control-Allow-Origin"] = origin
+            response.headers["Vary"] = "Origin"
+            response.headers["Access-Control-Allow-Credentials"] = "true"
+
+    response.headers["Access-Control-Allow-Methods"] = (
+        "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+    )
+    response.headers["Access-Control-Allow-Headers"] = (
+        "Content-Type, Authorization, X-Requested-With"
+    )
     return response
 
 

@@ -1,4 +1,7 @@
-# Falantir v2 — Dependencies
+# Falantir v2.1 — Dependencies
+# v2.1 changes: YOLO/ultralytics removed. Gemini 2.5 Flash is primary vision
+# via google-generativeai (structured output). PyTorch kept for the local
+# MobileNetV3 student model used as offline fallback (Tier 2).
 
 # Core Framework
 flask==3.1.0
@@ -10,10 +13,9 @@ gevent-websocket==0.10.1
 simple-websocket==1.1.0
 
 # AI / ML
-ultralytics==8.0.136
-torch>=2.0.0
-torchvision>=0.15.0
-google-generativeai==0.8.0
+google-generativeai>=0.8.3       # Gemini 2.5 Flash with response_schema
+torch>=2.0.0                     # For MobileNetV3 fallback
+torchvision>=0.15.0              # MobileNetV3-Large backbone
 
 # Computer Vision
 opencv-python==4.8.0.74
@@ -35,7 +37,7 @@ python-dotenv==1.0.1
 python-multipart==0.0.12
 pydantic[email-validation]==2.9.2
 email-validator==2.2.0
-huggingface-hub==0.25.0
+huggingface-hub==0.25.0          # For downloading student model weights
 
 # Legacy (v1 FastAPI — still available)
 fastapi==0.115.0

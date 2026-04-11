@@ -20,15 +20,36 @@ _db = None
 
 
 def get_db():
-    """Get the database instance, connecting if needed."""
+    """Get the database instance, connecting if needed.
+
+    TLS is only enabled for remote / Atlas connections. Local dev instances
+    (mongodb://localhost/, 127.0.0.1/, plain hostnames) use an unencrypted
+    connection, because forcing TLS on a non-TLS local mongod crashes the
+    driver with 'SSL handshake failed'.
+    """
     global _client, _db
     if _db is None:
-        import certifi
-        ca = certifi.where()
+        uri_lower = MONGO_URI.lower()
+        is_local = (
+            "localhost" in uri_lower
+            or "127.0.0.1" in uri_lower
+            or "host.docker.internal" in uri_lower
+        )
+        is_srv = uri_lower.startswith("mongodb+srv://")
+        use_tls = is_srv or (not is_local)
+
+        kwargs = {"serverSelectionTimeoutMS": 5000}
+        if use_tls:
+            import certifi
+            kwargs["tlsCAFile"] = certifi.where()
+
         try:
-            _client = MongoClient(MONGO_URI, tlsCAFile=ca)
+            _client = MongoClient(MONGO_URI, **kwargs)
             _db = _client[DATABASE_NAME]
-            print(f"DATABASE: Client created for {DATABASE_NAME}")
+            print(
+                f"DATABASE: Client created for {DATABASE_NAME} "
+                f"(tls={'on' if use_tls else 'off'})"
+            )
         except Exception as e:
             print(f"DATABASE CONNECTION ERROR: {e}")
             raise e

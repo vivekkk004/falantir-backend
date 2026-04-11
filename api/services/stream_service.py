@@ -1,9 +1,16 @@
 """
-Multi-Agent Live Stream Service.
+Multi-Agent Live Stream Service — Falantir v2.1
 
 Each camera agent runs its own background thread, reading frames from an
-RTSP stream or video file. On every processed frame, all three models run
-in parallel and results are emitted over WebSocket.
+RTSP stream, webcam, or video file.
+
+v2.1 changes vs v2:
+  - YOLO gone; single Gemini 2.5 Flash structured-output call via
+    vision_provider abstraction.
+  - Motion gate (OpenCV MOG2) in front of the vision provider, so we
+    don't burn API credit on empty frames.
+  - Idle frames still stream to the browser (annotated with the last
+    known threat label) so the live feed never freezes.
 """
 
 import threading
@@ -15,12 +22,22 @@ import numpy as np
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 
+from api.services.motion_detector import MotionDetector
+
 load_dotenv()
 
 WIDTH = 640
-FRAME_SKIP = int(os.getenv("FRAME_SKIP", "3"))
 MAX_CAMERAS = int(os.getenv("MAX_CAMERAS", "5"))
 THREAT_THRESHOLD = float(os.getenv("THREAT_THRESHOLD", "0.6"))
+
+# Minimum seconds between two vision-provider calls per agent, even if motion
+# stays high. Caps cost for agents pointed at busy scenes.
+MIN_ANALYSIS_INTERVAL_S = float(os.getenv("MIN_ANALYSIS_INTERVAL_S", "2.0"))
+
+# How often to emit a lightweight frame to the browser when nothing is being
+# analyzed (keeps the live view smooth).
+IDLE_FRAME_EMIT_EVERY_N = int(os.getenv("IDLE_FRAME_EMIT_EVERY_N", "5"))
+
 
 # ─── Agent Registry ───────────────────────────────────────
 
@@ -39,6 +56,17 @@ def _make_placeholder(msg="Connecting..."):
     return _encode_jpeg(img)
 
 
+def _overlay_status(frame, text, color=(200, 200, 200)):
+    """Small status pill in the top-right corner of the live frame."""
+    annotated = frame.copy()
+    (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+    x, y = annotated.shape[1] - tw - 16, 10
+    cv2.rectangle(annotated, (x - 4, y), (x + tw + 4, y + th + 8), (30, 30, 30), -1)
+    cv2.putText(annotated, text, (x, y + th + 2),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+    return annotated
+
+
 def _stream_loop(agent_id, camera_uri, socketio, db_save_fn):
     """Background thread for a single camera agent."""
     from api.services.inference_pipeline import analyze_frame
@@ -53,7 +81,12 @@ def _stream_loop(agent_id, camera_uri, socketio, db_save_fn):
                 _active_agents[agent_id]["running"] = False
         return
 
+    motion_detector = MotionDetector()
     frame_count = 0
+    analyzed_count = 0
+    skipped_count = 0
+    last_analysis_ts = 0.0
+    last_result = None
     reconnect_attempts = 0
     max_reconnect = 5
 
@@ -82,55 +115,74 @@ def _stream_loop(agent_id, camera_uri, socketio, db_save_fn):
         reconnect_attempts = 0
         frame_count += 1
 
-        # Resize
+        # Resize for downstream processing
         h, w = frame.shape[:2]
         ratio = WIDTH / float(w)
         frame = cv2.resize(frame, (WIDTH, int(h * ratio)))
 
-        # Run Gemini only every FRAME_SKIP frames (rate limiting)
-        run_gemini = (frame_count % FRAME_SKIP == 0)
+        # ─── Motion gate ─────────────────────────────────
+        has_motion, motion_ratio = motion_detector.check(frame)
+        now = time.time()
+        interval_ok = (now - last_analysis_ts) >= MIN_ANALYSIS_INTERVAL_S
+        should_analyze = has_motion and interval_ok
 
-        # Run all three models in parallel
-        result = analyze_frame(frame, run_gemini=run_gemini)
+        if should_analyze:
+            # ─── Expensive path: call vision provider ────
+            result = analyze_frame(frame)
+            last_analysis_ts = now
+            analyzed_count += 1
 
-        # Store latest frame and result
-        annotated = result.pop("annotated_frame", frame)
-        frame_jpeg = _encode_jpeg(annotated)
+            annotated = result.pop("annotated_frame", frame)
+            frame_jpeg = _encode_jpeg(annotated)
+            last_result = result
 
-        with _agents_lock:
-            if agent_id in _active_agents:
-                _active_agents[agent_id]["latest_frame"] = frame_jpeg
-                _active_agents[agent_id]["latest_result"] = result
-                _active_agents[agent_id]["frame_count"] = frame_count
+            with _agents_lock:
+                if agent_id in _active_agents:
+                    _active_agents[agent_id]["latest_frame"] = frame_jpeg
+                    _active_agents[agent_id]["latest_result"] = result
+                    _active_agents[agent_id]["frame_count"] = frame_count
+                    _active_agents[agent_id]["analyzed_count"] = analyzed_count
+                    _active_agents[agent_id]["skipped_count"] = skipped_count
 
-        # Emit agent_update via WebSocket
-        update_payload = {
-            "agent_id": agent_id,
-            "threat_label": result["threat_label"],
-            "threat_level": result["threat_level"],
-            "confidence": result["confidence"],
-            "probabilities": result["probabilities"],
-            "gemini_description": result["gemini_description"],
-            "yolo_objects": result["yolo_objects"],
-            "inference_time_ms": result["inference_time_ms"],
-            "frame_count": frame_count,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
+            # Emit agent_update via WebSocket
+            update_payload = {
+                "agent_id": agent_id,
+                "threat_label": result["threat_label"],
+                "threat_level": result["threat_level"],
+                "confidence": result["confidence"],
+                "probabilities": result["probabilities"],
+                "scene_description": result.get("scene_description", ""),
+                "gemini_description": result.get("scene_description", ""),  # legacy
+                "reasoning": result.get("reasoning", ""),
+                "detected_objects": result.get("detected_objects", []),
+                "yolo_objects": result.get("detected_objects", []),  # legacy
+                "provider_used": result.get("provider_used", "unknown"),
+                "model": result.get("model", "unknown"),
+                "inference_time_ms": result.get("inference_time_ms", 0),
+                "frame_count": frame_count,
+                "analyzed_count": analyzed_count,
+                "motion_ratio": round(motion_ratio, 4),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
 
-        if socketio:
-            socketio.emit("agent_update", update_payload, room=agent_id)
+            if socketio:
+                socketio.emit("agent_update", update_payload, room=agent_id)
 
-        # Save incident to DB if suspicious or critical
-        if result["threat_level"] >= 1 and result["confidence"] >= THREAT_THRESHOLD:
-            if frame_count % 40 == 0:  # Don't save every frame
+            # Save incident if suspicious or critical
+            if result["threat_level"] >= 1 and result["confidence"] >= THREAT_THRESHOLD:
                 _, snap_buf = cv2.imencode(".jpg", annotated)
                 incident = {
                     "agent_id": agent_id,
                     "threat_label": result["threat_label"],
                     "threat_level": result["threat_level"],
                     "confidence": result["confidence"],
-                    "gemini_description": result["gemini_description"],
-                    "yolo_objects": result["yolo_objects"],
+                    "scene_description": result.get("scene_description", ""),
+                    "gemini_description": result.get("scene_description", ""),  # legacy
+                    "reasoning": result.get("reasoning", ""),
+                    "detected_objects": result.get("detected_objects", []),
+                    "yolo_objects": result.get("detected_objects", []),  # legacy
+                    "provider_used": result.get("provider_used", "unknown"),
+                    "model": result.get("model", "unknown"),
                     "timestamp": datetime.now(timezone.utc),
                     "snapshot": base64.b64encode(snap_buf).decode(),
                     "acknowledged": False,
@@ -146,9 +198,42 @@ def _stream_loop(agent_id, camera_uri, socketio, db_save_fn):
                             "agent_id": agent_id,
                             "threat_label": result["threat_label"],
                             "confidence": result["confidence"],
-                            "description": result["gemini_description"],
+                            "description": result.get("scene_description", ""),
+                            "reasoning": result.get("reasoning", ""),
                             "timestamp": datetime.now(timezone.utc).isoformat(),
                         })
+
+        else:
+            # ─── Cheap path: no vision call, just keep the stream alive ──
+            skipped_count += 1
+
+            # Only encode every Nth idle frame — no need to stream 30 FPS of
+            # empty-shop footage, and it keeps CPU low.
+            if skipped_count % IDLE_FRAME_EMIT_EVERY_N == 0:
+                status_text = "IDLE (no motion)" if not has_motion else "COOLDOWN"
+                status_color = (120, 120, 120) if not has_motion else (0, 165, 255)
+
+                # Show the last known threat overlay so the UI isn't blank
+                if last_result:
+                    lbl = last_result.get("threat_label", "safe").upper()
+                    conf = last_result.get("confidence", 0.0)
+                    color_map = {
+                        "SAFE": (0, 200, 0),
+                        "SUSPICIOUS": (0, 165, 255),
+                        "CRITICAL": (0, 0, 255),
+                    }
+                    overlay_color = color_map.get(lbl, (200, 200, 200))
+                    cv2.putText(frame, f"{lbl} ({conf:.0%})", (10, 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, overlay_color, 2, cv2.LINE_AA)
+
+                frame = _overlay_status(frame, status_text, status_color)
+                frame_jpeg = _encode_jpeg(frame)
+
+                with _agents_lock:
+                    if agent_id in _active_agents:
+                        _active_agents[agent_id]["latest_frame"] = frame_jpeg
+                        _active_agents[agent_id]["frame_count"] = frame_count
+                        _active_agents[agent_id]["skipped_count"] = skipped_count
 
         time.sleep(0.01)
 
@@ -181,6 +266,8 @@ def start_stream(agent_id, camera_uri, socketio=None, db_save_fn=None):
             "latest_frame": _make_placeholder("Starting..."),
             "latest_result": None,
             "frame_count": 0,
+            "analyzed_count": 0,
+            "skipped_count": 0,
             "thread": None,
         }
 
@@ -229,9 +316,14 @@ def get_agent_status(agent_id):
             return {
                 "running": agent["running"],
                 "frame_count": agent.get("frame_count", 0),
+                "analyzed_count": agent.get("analyzed_count", 0),
+                "skipped_count": agent.get("skipped_count", 0),
                 "latest_result": agent.get("latest_result"),
             }
-    return {"running": False, "frame_count": 0, "latest_result": None}
+    return {
+        "running": False, "frame_count": 0,
+        "analyzed_count": 0, "skipped_count": 0, "latest_result": None,
+    }
 
 
 def get_all_statuses():
@@ -241,6 +333,8 @@ def get_all_statuses():
             aid: {
                 "running": a["running"],
                 "frame_count": a.get("frame_count", 0),
+                "analyzed_count": a.get("analyzed_count", 0),
+                "skipped_count": a.get("skipped_count", 0),
             }
             for aid, a in _active_agents.items()
         }

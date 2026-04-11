@@ -49,6 +49,11 @@ def upload_video():
         if not cap.isOpened():
             return jsonify({"success": False, "data": None, "error": "Cannot open video file"}), 400
 
+        # Rate-limit vision provider calls to protect API quota.
+        # Upload analyzes every Nth frame and caps total provider calls.
+        FRAME_STRIDE = 15           # look at every 15th frame
+        MAX_ANALYSIS_CALLS = 40     # hard cap on provider calls per upload
+
         total_frames = 0
         frames_analyzed = 0
         peak_result = None
@@ -63,15 +68,16 @@ def upload_video():
 
             total_frames += 1
 
-            # Analyze every 5th frame (more thorough than every 10th)
-            if total_frames % 5 != 0:
+            if total_frames % FRAME_STRIDE != 0:
+                continue
+
+            if frames_analyzed >= MAX_ANALYSIS_CALLS:
+                # Keep reading the video to get the true total_frames count,
+                # but stop calling the vision provider.
                 continue
 
             frames_analyzed += 1
-
-            # Run Gemini every 20 analyzed frames to stay under rate limits
-            run_gemini = (frames_analyzed % 20 == 0)
-            result = analyze_frame(frame, run_gemini=run_gemini)
+            result = analyze_frame(frame)
 
             # Collect all non-safe detections
             if result["threat_level"] > 0:
@@ -79,7 +85,7 @@ def upload_video():
                     "frame": total_frames,
                     "threat_label": result["threat_label"],
                     "confidence": result["confidence"],
-                    "yolo_objects": result["yolo_objects"],
+                    "detected_objects": result["detected_objects"],
                 })
 
             # Track peak threat frame
@@ -94,26 +100,20 @@ def upload_video():
                     "threat_level": result["threat_level"],
                     "confidence": result["confidence"],
                     "probabilities": result["probabilities"],
-                    "gemini_description": result["gemini_description"],
-                    "yolo_objects": result["yolo_objects"],
-                    "inference_time_ms": result["inference_time_ms"],
+                    "scene_description": result.get("scene_description", ""),
+                    "gemini_description": result.get("scene_description", ""),  # legacy
+                    "reasoning": result.get("reasoning", ""),
+                    "detected_objects": result.get("detected_objects", []),
+                    "yolo_objects": result.get("detected_objects", []),  # legacy
+                    "provider_used": result.get("provider_used", "unknown"),
+                    "model": result.get("model", "unknown"),
+                    "inference_time_ms": result.get("inference_time_ms", 0),
                 }
 
         cap.release()
 
         if peak_result is None:
             return jsonify({"success": False, "data": None, "error": "No frames could be analyzed"}), 400
-
-        # Always run Gemini on the peak frame to get a real description
-        if peak_frame is not None and (
-            not peak_result.get("gemini_description")
-            or peak_result["gemini_description"] == "Skipped (frame skip)"
-        ):
-            final = analyze_frame(peak_frame, run_gemini=True)
-            peak_result["gemini_description"] = final["gemini_description"]
-            # Also update YOLO if it found more objects
-            if len(final["yolo_objects"]) > len(peak_result.get("yolo_objects", [])):
-                peak_result["yolo_objects"] = final["yolo_objects"]
 
         peak_result["total_frames"] = total_frames
         peak_result["frames_analyzed"] = frames_analyzed
@@ -127,8 +127,13 @@ def upload_video():
                 "threat_label": peak_result["threat_label"],
                 "threat_level": peak_result["threat_level"],
                 "confidence": peak_result["confidence"],
-                "gemini_description": peak_result["gemini_description"],
-                "yolo_objects": peak_result["yolo_objects"],
+                "scene_description": peak_result["scene_description"],
+                "gemini_description": peak_result["scene_description"],  # legacy
+                "reasoning": peak_result["reasoning"],
+                "detected_objects": peak_result["detected_objects"],
+                "yolo_objects": peak_result["detected_objects"],  # legacy
+                "provider_used": peak_result["provider_used"],
+                "model": peak_result["model"],
                 "timestamp": datetime.now(timezone.utc),
                 "snapshot": base64.b64encode(snap_buf).decode(),
                 "acknowledged": False,
@@ -173,6 +178,17 @@ def get_incidents():
         inc["_id"] = str(inc["_id"])
         if isinstance(inc.get("timestamp"), datetime):
             inc["timestamp"] = inc["timestamp"].isoformat()
+
+        # Back-compat: old records stored `yolo_objects`; new code expects
+        # `detected_objects`. Make both available either way.
+        if "detected_objects" not in inc and "yolo_objects" in inc:
+            inc["detected_objects"] = inc["yolo_objects"]
+        if "yolo_objects" not in inc and "detected_objects" in inc:
+            inc["yolo_objects"] = inc["detected_objects"]
+        if "scene_description" not in inc and "gemini_description" in inc:
+            inc["scene_description"] = inc["gemini_description"]
+        if "gemini_description" not in inc and "scene_description" in inc:
+            inc["gemini_description"] = inc["scene_description"]
 
     return jsonify({
         "success": True,
