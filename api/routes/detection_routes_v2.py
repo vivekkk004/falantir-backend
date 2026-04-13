@@ -42,6 +42,7 @@ def upload_video():
 
     try:
         import cv2
+        import time
         import base64
         from api.services.inference_pipeline import analyze_frame
 
@@ -49,17 +50,30 @@ def upload_video():
         if not cap.isOpened():
             return jsonify({"success": False, "data": None, "error": "Cannot open video file"}), 400
 
-        # Rate-limit vision provider calls to protect API quota.
-        # Upload analyzes every Nth frame and caps total provider calls.
-        FRAME_STRIDE = 15           # look at every 15th frame
-        MAX_ANALYSIS_CALLS = 40     # hard cap on provider calls per upload
+        # ─── Quota-friendly sampling ──────────────────────────────
+        # Gemini 2.5 Flash Lite free tier is 15 RPM. We must throttle to
+        # ~13 RPM to stay safely under the limit, and stop the moment the
+        # API returns a 429 so we don't burn through the remaining quota.
+        TARGET_SAMPLES = int(os.getenv("UPLOAD_TARGET_SAMPLES", "12"))
+        MIN_INTERVAL_S = float(os.getenv("UPLOAD_MIN_INTERVAL_S", "4.5"))
+
+        total_frames_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+        # Space samples EVENLY across the whole video, not just the start.
+        stride = max(1, total_frames_count // TARGET_SAMPLES) if total_frames_count else 15
 
         total_frames = 0
         frames_analyzed = 0
+        frames_failed = 0
         peak_result = None
         peak_threat = -1
         peak_frame = None
         all_detections = []
+        last_call_ts = 0.0
+        quota_hit = False
+
+        def _looks_like_quota_error(r):
+            msg = (r.get("reasoning", "") + " " + r.get("scene_description", "")).lower()
+            return "429" in msg or "quota" in msg or "rate" in msg
 
         while True:
             ret, frame = cap.read()
@@ -68,16 +82,30 @@ def upload_video():
 
             total_frames += 1
 
-            if total_frames % FRAME_STRIDE != 0:
+            if total_frames % stride != 0:
                 continue
 
-            if frames_analyzed >= MAX_ANALYSIS_CALLS:
-                # Keep reading the video to get the true total_frames count,
-                # but stop calling the vision provider.
+            if frames_analyzed >= TARGET_SAMPLES or quota_hit:
+                # Keep reading to compute accurate total_frames, no more API calls
+                continue
+
+            # Throttle between Gemini calls so we stay under 15 RPM
+            now = time.time()
+            wait = MIN_INTERVAL_S - (now - last_call_ts)
+            if wait > 0 and last_call_ts > 0:
+                time.sleep(wait)
+
+            result = analyze_frame(frame)
+            last_call_ts = time.time()
+
+            # Detect rate limit → stop early
+            if _looks_like_quota_error(result):
+                quota_hit = True
+                frames_failed += 1
+                print(f"UPLOAD: Gemini quota hit after {frames_analyzed} calls — stopping")
                 continue
 
             frames_analyzed += 1
-            result = analyze_frame(frame)
 
             # Collect all non-safe detections
             if result["threat_level"] > 0:
@@ -112,11 +140,29 @@ def upload_video():
 
         cap.release()
 
+        if frames_analyzed == 0:
+            # Every analysis attempt failed — most likely quota exhausted
+            err_msg = (
+                "Gemini API quota exhausted (free tier is 15 RPM / ~1000 RPD). "
+                "Wait ~60s for the per-minute window to reset, or until tomorrow "
+                "for the daily quota."
+                if quota_hit
+                else "No frames could be analyzed"
+            )
+            return jsonify({
+                "success": False,
+                "data": None,
+                "error": err_msg,
+                "quota_hit": quota_hit,
+            }), 429 if quota_hit else 400
+
         if peak_result is None:
             return jsonify({"success": False, "data": None, "error": "No frames could be analyzed"}), 400
 
         peak_result["total_frames"] = total_frames
         peak_result["frames_analyzed"] = frames_analyzed
+        peak_result["frames_failed"] = frames_failed
+        peak_result["quota_hit"] = quota_hit
         peak_result["threat_detections"] = len(all_detections)
 
         # Save to database if threat detected
