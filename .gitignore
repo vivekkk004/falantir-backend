@@ -15,7 +15,18 @@ Thumbs.db
 
 # Models (too large for git)
 models/*.pt
+api/models/*.pt
 configs/*.pt
+
+# Datasets (raw and preprocessed)
+dataset/
+dataset_imagefolder/
+dataset_imagefolder.zip
+*.zip
+
+# Generated submission artefacts (derived from the .md source)
+Falantir_Project_Report.docx
+Falantir_Project_Slides.pptx
 
 # Temp
 *.log

@@ -23,12 +23,28 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 
 from api.services.motion_detector import MotionDetector
+from api.notifications import notify_all
+from api.database_v2 import users_col
 
 load_dotenv()
 
 WIDTH = 640
 MAX_CAMERAS = int(os.getenv("MAX_CAMERAS", "5"))
 THREAT_THRESHOLD = float(os.getenv("THREAT_THRESHOLD", "0.6"))
+
+# Minimum seconds between two email/SMS alerts for the same agent. Prevents
+# Twilio bill explosions when a scene stays suspicious for minutes.
+ALERT_COOLDOWN_S = float(os.getenv("ALERT_COOLDOWN_S", "300"))
+_last_alert_time = {}  # agent_id -> unix timestamp
+
+
+def _send_alert_to_all_users(message):
+    """Fan out an alert message to every active user via email + SMS."""
+    try:
+        for user in users_col().find({"is_active": True}):
+            notify_all(user.get("email"), user.get("phone"), message)
+    except Exception as e:
+        print(f"ALERT: notification fan-out failed — {e}")
 
 # Minimum seconds between two vision-provider calls per agent, even if motion
 # stays high. Caps cost for agents pointed at busy scenes.
@@ -191,8 +207,8 @@ def _stream_loop(agent_id, camera_uri, socketio, db_save_fn):
                 if db_save_fn:
                     threading.Thread(target=db_save_fn, args=(incident,), daemon=True).start()
 
-                # Emit critical alert event
-                if result["threat_level"] == 2:
+                # Emit dashboard alert for suspicious or critical threats
+                if result["threat_level"] >= 1:
                     if socketio:
                         socketio.emit("incident_alert", {
                             "agent_id": agent_id,
@@ -202,6 +218,25 @@ def _stream_loop(agent_id, camera_uri, socketio, db_save_fn):
                             "reasoning": result.get("reasoning", ""),
                             "timestamp": datetime.now(timezone.utc).isoformat(),
                         })
+
+                    # Send email/SMS to all active users, rate-limited per agent
+                    # so a long suspicious event doesn't burn the Twilio budget.
+                    now = time.time()
+                    last = _last_alert_time.get(agent_id, 0)
+                    if now - last >= ALERT_COOLDOWN_S:
+                        _last_alert_time[agent_id] = now
+                        label = result["threat_label"].upper()
+                        conf = result["confidence"]
+                        reason = result.get("reasoning", "")
+                        alert_msg = (
+                            f"[Falantir] {label} detected on agent {agent_id} "
+                            f"({conf:.0%}). {reason}"
+                        )
+                        threading.Thread(
+                            target=_send_alert_to_all_users,
+                            args=(alert_msg,),
+                            daemon=True,
+                        ).start()
 
         else:
             # ─── Cheap path: no vision call, just keep the stream alive ──

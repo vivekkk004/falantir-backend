@@ -2,6 +2,7 @@
 
 import os
 import tempfile
+import threading
 from datetime import datetime, timezone
 from flask import Blueprint, request, jsonify, g
 from api.auth_v2 import login_required
@@ -165,6 +166,12 @@ def upload_video():
         peak_result["quota_hit"] = quota_hit
         peak_result["threat_detections"] = len(all_detections)
 
+        # Always send the peak frame back to the frontend so it can render the
+        # bounding-box overlay. (Independent of whether we saved an incident.)
+        if peak_frame is not None:
+            _, peak_buf = cv2.imencode(".jpg", peak_frame)
+            peak_result["peak_snapshot_b64"] = base64.b64encode(peak_buf).decode()
+
         # Save to database if threat detected
         if peak_result["threat_level"] > 0 and peak_frame is not None:
             _, snap_buf = cv2.imencode(".jpg", peak_frame)
@@ -187,6 +194,22 @@ def upload_video():
                 "filename": video_file.filename,
             }
             save_incident(incident)
+
+            # Send email/SMS alert to the uploader for suspicious or critical threats.
+            # Run in background thread so notifications don't block the API response.
+            user = g.user
+            label = peak_result["threat_label"].upper()
+            conf = peak_result["confidence"]
+            reason = peak_result.get("reasoning", "")
+            alert_msg = (
+                f"[Falantir] {label} detected ({conf:.0%}) in uploaded video "
+                f"'{video_file.filename}'. {reason}"
+            )
+            threading.Thread(
+                target=notify_all,
+                args=(user.get("email"), user.get("phone"), alert_msg),
+                daemon=True,
+            ).start()
 
         return jsonify({"success": True, "data": peak_result, "error": None})
 
