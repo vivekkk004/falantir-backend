@@ -38,11 +38,16 @@ ALERT_COOLDOWN_S = float(os.getenv("ALERT_COOLDOWN_S", "300"))
 _last_alert_time = {}  # agent_id -> unix timestamp
 
 
-def _send_alert_to_all_users(message):
+def _send_alert_to_all_users(message, alert_context=None):
     """Fan out an alert message to every active user via email + SMS."""
     try:
         for user in users_col().find({"is_active": True}):
-            notify_all(user.get("email"), user.get("phone"), message)
+            notify_all(
+                user.get("email"),
+                user.get("phone"),
+                message,
+                alert_context=alert_context,
+            )
     except Exception as e:
         print(f"ALERT: notification fan-out failed — {e}")
 
@@ -232,9 +237,19 @@ def _stream_loop(agent_id, camera_uri, socketio, db_save_fn):
                             f"[Falantir] {label} detected on agent {agent_id} "
                             f"({conf:.0%}). {reason}"
                         )
+                        alert_ctx = {
+                            "threat_label": result["threat_label"],
+                            "confidence": result["confidence"],
+                            "reasoning": result.get("reasoning", ""),
+                            "scene_description": result.get("scene_description", ""),
+                            "source": f"Live agent: {agent_id}",
+                            "timestamp": datetime.now(timezone.utc).strftime("%d %b %Y, %H:%M UTC"),
+                            "snapshot_b64": base64.b64encode(snap_buf).decode(),
+                        }
                         threading.Thread(
                             target=_send_alert_to_all_users,
                             args=(alert_msg,),
+                            kwargs={"alert_context": alert_ctx},
                             daemon=True,
                         ).start()
 

@@ -205,9 +205,19 @@ def upload_video():
                 f"[Falantir] {label} detected ({conf:.0%}) in uploaded video "
                 f"'{video_file.filename}'. {reason}"
             )
+            alert_ctx = {
+                "threat_label": peak_result["threat_label"],
+                "confidence": peak_result["confidence"],
+                "reasoning": peak_result.get("reasoning", ""),
+                "scene_description": peak_result.get("scene_description", ""),
+                "source": f"Video upload: {video_file.filename}",
+                "timestamp": datetime.now(timezone.utc).strftime("%d %b %Y, %H:%M UTC"),
+                "snapshot_b64": peak_result.get("peak_snapshot_b64"),
+            }
             threading.Thread(
                 target=notify_all,
                 args=(user.get("email"), user.get("phone"), alert_msg),
+                kwargs={"alert_context": alert_ctx},
                 daemon=True,
             ).start()
 
