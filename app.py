@@ -46,9 +46,13 @@ CORS(
     methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
 )
 
-# Use eventlet when running under gunicorn (Render) for proper WebSocket support.
-# Fall back to threading for local dev (python app.py).
-_async_mode = "threading"
+# Async mode:
+#   • Local dev (python app.py)      → "threading"  (default)
+#   • Production (gunicorn on Railway)→ "gevent"     (set SOCKETIO_ASYNC_MODE=gevent)
+# The gunicorn worker is geventwebsocket.gunicorn.workers.GeventWebSocketWorker,
+# which monkey-patches gevent so pymongo / requests run cooperatively.
+_async_mode = os.getenv("SOCKETIO_ASYNC_MODE", "threading")
+print(f"SocketIO async_mode = {_async_mode}")
 
 socketio = SocketIO(
     app,
@@ -113,10 +117,15 @@ def _force_cors(response):
 def handle_options(path):
     from flask import make_response
     response = make_response()
-    response.headers["Access-Control-Allow-Origin"] = request.headers.get("Origin", "*")
+    origin = request.headers.get("Origin", "")
+    # Only reflect allowlisted origins (required when credentials are allowed —
+    # the browser rejects "*" + credentials). Set CORS_ORIGINS on Railway.
+    if origin and (_cors_origins == "*" or (_cors_origins_set and origin in _cors_origins_set)):
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+        response.headers["Vary"] = "Origin"
     response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
     response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With"
-    response.headers["Access-Control-Allow-Credentials"] = "true"
     response.headers["Access-Control-Max-Age"] = "86400"
     return response, 200
 
@@ -151,7 +160,20 @@ def handle_leave_agent(data):
 
 # ─── Startup ─────────────────────────────────────────────
 
-def init_app():
+import threading
+
+def _warmup_models():
+    """Load/warm AI models off the request path. Failures are non-fatal."""
+    try:
+        from api.services.inference_pipeline import load_all_models
+        load_all_models()
+        print("MODELS: warmup complete")
+    except Exception as model_err:
+        print(f"MODEL LOAD WARNING: {model_err}")
+        print("  AI vision degraded; auth/user routes still work normally.")
+
+
+def init_app(load_models=True):
     """Initialize app: DB first (critical), then AI models (optional)."""
     print("=" * 50)
     print("  FALANTIR v2 — Autonomous AI Security Agent")
@@ -161,13 +183,8 @@ def init_app():
     from api.database_v2 import init_db
     init_db()
 
-    # Optional: AI models — failures are non-fatal
-    try:
-        from api.services.inference_pipeline import load_all_models
-        load_all_models()
-    except Exception as model_err:
-        print(f"MODEL LOAD WARNING: {model_err}")
-        print("  AI features disabled; auth/user routes still work normally.")
+    if load_models:
+        _warmup_models()
 
     print("=" * 50)
     print("  System ready")
@@ -175,33 +192,47 @@ def init_app():
 
 
 # ─── One-time lazy init on first request ─────────────────
-# SERVER_SOFTWARE is a WSGI per-request variable — NOT an OS env var.
-# Using before_request ensures the server always starts cleanly (no 502),
-# and initialises DB + models on the very first real request.
+# Keeps the server booting instantly (no 502): DB connects on the first REAL
+# request, and AI models warm up in a BACKGROUND thread so they never block a
+# request or the platform health check. Thread-safe via a lock.
 _app_initialized = False
+_init_lock = threading.Lock()
+# Paths that must always return fast — never trigger init (health/preflight).
+_SKIP_INIT_PATHS = {"/api/health", "/"}
 
 @app.before_request
 def _lazy_init():
     global _app_initialized
-    if not _app_initialized:
+    if request.method == "OPTIONS" or request.path in _SKIP_INIT_PATHS:
+        return
+    if _app_initialized:
+        return
+    with _init_lock:
+        if _app_initialized:
+            return
         _app_initialized = True
         try:
-            init_app()
+            init_app(load_models=False)          # DB now (fast)
         except Exception as err:
             print(f"STARTUP ERROR: {err}")
             print("  Some routes may fail until DB is reachable.")
+        # Warm AI models in the background — first request isn't blocked.
+        threading.Thread(target=_warmup_models, daemon=True).start()
 
 # Alias for gunicorn: `gunicorn app:app`
 application = app
 
 
 if __name__ == "__main__":
+    # Local dev only. In production gunicorn imports `app:app`; this block
+    # does NOT run, so the gunicorn start command controls host/port/worker.
     init_app()
     debug = os.getenv("FLASK_DEBUG", "false").lower() == "true"
+    port = int(os.environ.get("PORT", 8000))
     socketio.run(
         app,
         host="0.0.0.0",
-        port=8000,
+        port=port,
         debug=debug,
         allow_unsafe_werkzeug=True,
     )

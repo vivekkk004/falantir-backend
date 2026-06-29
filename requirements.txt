@@ -1,14 +1,47 @@
-ultralytics==8.0.136
+# ─────────────────────────────────────────────────────────────
+# Falantir v2.1 — PRODUCTION dependencies (Railway installs this file)
+#
+# Railway/Nixpacks auto-installs `requirements.txt`. This is the v2 Flask
+# stack — NOT the old v1 FastAPI stack. Lean on purpose:
+#   • opencv-python-HEADLESS (no system libGL needed on a server)
+#   • gunicorn + gevent + gevent-websocket (production WSGI + WebSocket)
+#   • torch/torchvision/ultralytics REMOVED — the offline MobileNetV3
+#     fallback is disabled in prod (huge image / RAM). Gemini is primary,
+#     SafeFallback covers Gemini outages. Re-add CPU torch only if needed.
+# ─────────────────────────────────────────────────────────────
+
+# Core framework
+flask==3.1.0
+flask-cors==5.0.1
+flask-socketio==5.4.1
+
+# Production server + WebSocket worker
+gunicorn==23.0.0
+gevent>=23.9.0
+gevent-websocket==0.10.1
+simple-websocket==1.1.0
+
+# AI vision (Gemini 2.5 Flash — primary)
+google-generativeai>=0.8.3
+
+# Computer vision (headless build = no libGL.so.1 crash on servers)
+opencv-python-headless==4.8.1.78
 numpy==1.24.3
 imutils==0.5.4
-opencv-python==4.8.0.74
-fastapi==0.115.0
-uvicorn[standard]==0.31.0
+
+# Database
+pymongo==4.10.1
+certifi>=2024.2.2
+
+# Authentication
 python-jose[cryptography]==3.3.0
 bcrypt==4.2.1
-motor==3.6.0
+
+# Notifications
+twilio==8.1.0
+
+# Utilities
+python-dotenv==1.0.1
 python-multipart==0.0.12
 pydantic[email-validation]==2.9.2
 email-validator==2.2.0
-twilio==8.1.0
-python-dotenv==1.0.1
