@@ -191,12 +191,16 @@ def send_email(to_email, subject, body, html=None, image_b64=None):
             msg["Subject"] = subject
             msg.attach(MIMEText(body, "plain"))
 
-        server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
-        server.starttls()
+        # Port 465 = implicit SSL (Hostinger's recommended port); 587 = STARTTLS.
+        if int(SMTP_PORT) == 465:
+            server = smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT, timeout=20)
+        else:
+            server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=20)
+            server.starttls()
         server.login(SMTP_USER, SMTP_PASS)
         server.send_message(msg)
         server.quit()
-        print(f"EMAIL SENT: To {to_email}")
+        print(f"EMAIL SENT (SMTP {SMTP_SERVER}:{SMTP_PORT}): To {to_email}")
         return True
     except Exception as e:
         print(f"EMAIL ERROR: {e}")
