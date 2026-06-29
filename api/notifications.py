@@ -250,6 +250,14 @@ def notify_all(user_email, user_phone, message, alert_context=None):
     HTML alert with optional inline snapshot. The plain `message` is still
     used for SMS (which has no HTML support and a 160-character limit).
     """
+    # Fallback recipients: on the live deployment the register form does not
+    # collect a phone, so user records have an empty phone -> SMS/calls get
+    # silently skipped. Set ALERT_TO_NUMBER (and optionally ALERT_TO_EMAIL) in
+    # the environment to guarantee a recipient. On a Twilio trial the number
+    # must be verified.
+    user_phone = (user_phone or os.getenv("ALERT_TO_NUMBER", "")).strip()
+    user_email = (user_email or os.getenv("ALERT_TO_EMAIL", "")).strip()
+
     results = {}
     if user_email:
         if alert_context:
