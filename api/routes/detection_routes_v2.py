@@ -1,422 +1,302 @@
-"""Falantir v2 — Detection & analysis routes (Flask Blueprint)."""
- 
 import os
-import tempfile
-import threading
-from datetime import datetime, timezone
-from flask import Blueprint, request, jsonify, g
-from api.auth_v2 import login_required
-from api.database_v2 import incidents_col, rl_feedback_col, analytics_col, save_incident
-from api.services.inference_pipeline import get_models_status
-from api.notifications import notify_all
-from api.database_v2 import users_col
-from bson import ObjectId
+import base64
+import smtplib
+from datetime import datetime
+from email.mime.text import MIMEText
+from email.mime.image import MIMEImage
+from email.mime.multipart import MIMEMultipart
+try:
+    from twilio.rest import Client as TwilioClient
+    _HAS_TWILIO = True
+except ImportError:
+    _HAS_TWILIO = False
  
-detection_bp = Blueprint("detection", __name__, url_prefix="/api/detection")
+try:
+    from api.database_v2 import log_notification
+except Exception:
+    def log_notification(*args, **kwargs):  # DB unavailable — best-effort
+        pass
+ 
+SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.gmail.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER", "")
+SMTP_PASS = os.getenv("SMTP_PASS", "")
+FROM_EMAIL = os.getenv("FROM_EMAIL", SMTP_USER)
+DASHBOARD_URL = os.getenv("DASHBOARD_URL", "http://localhost:5173")
+ 
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
+TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER", "")
  
  
-@detection_bp.route("/models", methods=["GET"])
-@login_required
-def models_status():
-    """Return status of all three AI models."""
-    status = get_models_status()
-    return jsonify({"success": True, "data": status, "error": None})
+_THREAT_COLORS = {
+    "safe": "#22c55e",
+    "suspicious": "#f59e0b",
+    "critical": "#ef4444",
+}
  
  
-@detection_bp.route("/upload", methods=["POST"])
-@login_required
-def upload_video():
-    """Upload a video file, analyze with all three models, return results."""
-    if "video" not in request.files:
-        return jsonify({"success": False, "data": None, "error": "No video file provided"}), 400
+def _build_alert_email_html(ctx):
+    """Render a branded HTML alert email. Returns (html, plain_fallback)."""
+    threat_label = (ctx.get("threat_label") or "suspicious").lower()
+    threat_color = _THREAT_COLORS.get(threat_label, "#f59e0b")
+    confidence = ctx.get("confidence", 0.0)
+    confidence_pct = f"{confidence * 100:.0f}"
+    source = ctx.get("source", "Unknown source")
+    timestamp = ctx.get("timestamp") or datetime.utcnow().strftime("%d %b %Y, %H:%M UTC")
+    scene_description = ctx.get("scene_description") or "No description available."
+    reasoning = ctx.get("reasoning") or "No reasoning available."
+    has_snapshot = bool(ctx.get("snapshot_b64"))
+    snapshot_html = (
+        '<tr><td style="padding:0 32px 24px 32px;">'
+        '<div style="font-size:12px;color:#64748b;font-weight:600;letter-spacing:1px;margin-bottom:8px;">CAPTURED FRAME</div>'
+        '<img src="cid:snapshot" alt="Threat snapshot" style="width:100%;max-width:536px;border-radius:8px;border:1px solid #e2e8f0;display:block;">'
+        '</td></tr>'
+        if has_snapshot else ''
+    )
  
-    video_file = request.files["video"]
-    if not video_file.filename:
-        return jsonify({"success": False, "data": None, "error": "Empty filename"}), 400
+    html = f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Falantir Security Alert</title>
+</head>
+<body style="margin:0;padding:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;background-color:#f1f5f9;">
+<table cellpadding="0" cellspacing="0" border="0" width="100%" style="background-color:#f1f5f9;padding:24px 0;">
+<tr><td align="center">
+<table cellpadding="0" cellspacing="0" border="0" width="600" style="background-color:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,0.1);max-width:600px;">
  
-    # Save to temp file
-    suffix = os.path.splitext(video_file.filename)[1] or ".mp4"
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-    tmp_path = tmp.name
-    video_file.save(tmp_path)
-    tmp.close()
+<tr>
+<td style="background-color:#0f172a;padding:24px 32px;color:#ffffff;">
+<table width="100%" cellpadding="0" cellspacing="0">
+<tr>
+<td>
+<div style="font-size:14px;font-weight:600;letter-spacing:2px;color:#10b981;">FALANTIR</div>
+<div style="font-size:18px;font-weight:700;margin-top:4px;color:#ffffff;">Security Alert</div>
+</td>
+<td align="right">
+<span style="display:inline-block;padding:6px 14px;background-color:{threat_color};color:#ffffff;border-radius:999px;font-size:12px;font-weight:700;letter-spacing:1px;text-transform:uppercase;">{threat_label}</span>
+</td>
+</tr>
+</table>
+</td>
+</tr>
+ 
+<tr>
+<td style="padding:32px 32px 8px 32px;">
+<div style="font-size:12px;color:#64748b;font-weight:600;letter-spacing:1px;margin-bottom:8px;">DETECTED</div>
+<div style="font-size:22px;font-weight:700;color:#0f172a;line-height:1.3;">{threat_label.title()} activity ({confidence_pct}% confidence)</div>
+</td>
+</tr>
+ 
+<tr>
+<td style="padding:0 32px;">
+<table width="100%" cellpadding="0" cellspacing="0" style="margin-top:20px;border-top:1px solid #e2e8f0;">
+<tr>
+<td style="padding:12px 0;width:100px;color:#64748b;font-size:13px;">Source</td>
+<td style="padding:12px 0;color:#0f172a;font-size:14px;font-weight:500;">{source}</td>
+</tr>
+<tr>
+<td style="padding:12px 0;color:#64748b;font-size:13px;border-top:1px solid #e2e8f0;">Time</td>
+<td style="padding:12px 0;color:#0f172a;font-size:14px;font-weight:500;border-top:1px solid #e2e8f0;">{timestamp}</td>
+</tr>
+</table>
+</td>
+</tr>
+ 
+<tr>
+<td style="padding:24px 32px 0 32px;">
+<div style="font-size:12px;color:#64748b;font-weight:600;letter-spacing:1px;margin-bottom:8px;">SCENE DESCRIPTION</div>
+<div style="font-size:14px;color:#334155;line-height:1.6;font-style:italic;">{scene_description}</div>
+</td>
+</tr>
+ 
+<tr>
+<td style="padding:24px 32px 0 32px;">
+<div style="padding:16px;background-color:#fff7ed;border-left:4px solid {threat_color};border-radius:6px;">
+<div style="font-size:11px;color:{threat_color};font-weight:700;letter-spacing:1px;margin-bottom:6px;">WHY FLAGGED</div>
+<div style="font-size:14px;color:#334155;line-height:1.5;">{reasoning}</div>
+</div>
+</td>
+</tr>
+ 
+{snapshot_html}
+ 
+<tr>
+<td style="padding:24px 32px 32px 32px;">
+<table width="100%" cellpadding="0" cellspacing="0">
+<tr><td align="center">
+<a href="{DASHBOARD_URL}" style="display:inline-block;padding:14px 32px;background-color:#0f172a;color:#ffffff;text-decoration:none;border-radius:8px;font-weight:600;font-size:14px;">View in Dashboard</a>
+</td></tr>
+</table>
+</td>
+</tr>
+ 
+<tr>
+<td style="background-color:#f8fafc;padding:20px 32px;border-top:1px solid #e2e8f0;">
+<div style="font-size:11px;color:#94a3b8;text-align:center;line-height:1.5;">
+This alert was automatically generated by Falantir Security System.<br>
+You are receiving this because your account is configured to receive security notifications.
+</div>
+</td>
+</tr>
+ 
+</table>
+</td></tr>
+</table>
+</body>
+</html>"""
+ 
+    plain = (
+        f"FALANTIR SECURITY ALERT\n"
+        f"=======================\n\n"
+        f"Threat: {threat_label.upper()} ({confidence_pct}% confidence)\n"
+        f"Source: {source}\n"
+        f"Time:   {timestamp}\n\n"
+        f"Scene Description:\n{scene_description}\n\n"
+        f"Why Flagged:\n{reasoning}\n\n"
+        f"View in dashboard: {DASHBOARD_URL}\n"
+    )
+    return html, plain
+ 
+ 
+def send_email(to_email, subject, body, html=None, image_b64=None):
+    """
+    Send an email. If `html` is provided, sends a multipart/alternative
+    message with both plain text and HTML parts. If `image_b64` is provided
+    (base64-encoded JPEG), attaches it inline with Content-ID 'snapshot'
+    so the HTML can reference it as <img src="cid:snapshot">.
+    """
+    if not SMTP_USER or not SMTP_PASS:
+        print(f"EMAIL SKIPPED (No credentials): To {to_email}")
+        log_notification("email", to_email, "skipped", detail=subject, error="no SMTP credentials")
+        return False
  
     try:
-        import cv2
-        import time
-        import base64
-        from api.services.inference_pipeline import analyze_frame
+        if html:
+            msg = MIMEMultipart("related")
+            msg["From"] = FROM_EMAIL
+            msg["To"] = to_email
+            msg["Subject"] = subject
+            alt = MIMEMultipart("alternative")
+            alt.attach(MIMEText(body, "plain"))
+            alt.attach(MIMEText(html, "html"))
+            msg.attach(alt)
+            if image_b64:
+                try:
+                    img_bytes = base64.b64decode(image_b64)
+                    img = MIMEImage(img_bytes, _subtype="jpeg")
+                    img.add_header("Content-ID", "<snapshot>")
+                    img.add_header("Content-Disposition", "inline", filename="snapshot.jpg")
+                    msg.attach(img)
+                except Exception as e:
+                    print(f"EMAIL: failed to attach inline image — {e}")
+        else:
+            msg = MIMEMultipart()
+            msg["From"] = FROM_EMAIL
+            msg["To"] = to_email
+            msg["Subject"] = subject
+            msg.attach(MIMEText(body, "plain"))
  
-        cap = cv2.VideoCapture(tmp_path)
-        if not cap.isOpened():
-            return jsonify({"success": False, "data": None, "error": "Cannot open video file"}), 400
- 
-        # ─── Quota-friendly sampling ──────────────────────────────
-        # Gemini 2.5 Flash Lite free tier is 15 RPM. We must throttle to
-        # ~13 RPM to stay safely under the limit, and stop the moment the
-        # API returns a 429 so we don't burn through the remaining quota.
-        TARGET_SAMPLES = int(os.getenv("UPLOAD_TARGET_SAMPLES", "12"))
-        MIN_INTERVAL_S = float(os.getenv("UPLOAD_MIN_INTERVAL_S", "4.5"))
- 
-        total_frames_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
-        # Space samples EVENLY across the whole video, not just the start.
-        stride = max(1, total_frames_count // TARGET_SAMPLES) if total_frames_count else 15
- 
-        total_frames = 0
-        frames_analyzed = 0
-        frames_failed = 0
-        peak_result = None
-        peak_threat = -1
-        peak_frame = None
-        all_detections = []
-        last_call_ts = 0.0
-        quota_hit = False
- 
-        def _looks_like_quota_error(r):
-            msg = (r.get("reasoning", "") + " " + r.get("scene_description", "")).lower()
-            return "429" in msg or "quota" in msg or "rate" in msg
- 
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
- 
-            total_frames += 1
- 
-            if total_frames % stride != 0:
-                continue
- 
-            if frames_analyzed >= TARGET_SAMPLES or quota_hit:
-                # Keep reading to compute accurate total_frames, no more API calls
-                continue
- 
-            # Throttle between Gemini calls so we stay under 15 RPM
-            now = time.time()
-            wait = MIN_INTERVAL_S - (now - last_call_ts)
-            if wait > 0 and last_call_ts > 0:
-                time.sleep(wait)
- 
-            result = analyze_frame(frame)
-            last_call_ts = time.time()
- 
-            # Detect rate limit → stop early
-            if _looks_like_quota_error(result):
-                quota_hit = True
-                frames_failed += 1
-                print(f"UPLOAD: Gemini quota hit after {frames_analyzed} calls — stopping")
-                continue
- 
-            frames_analyzed += 1
- 
-            # Collect all non-safe detections
-            if result["threat_level"] > 0:
-                all_detections.append({
-                    "frame": total_frames,
-                    "threat_label": result["threat_label"],
-                    "confidence": result["confidence"],
-                    "detected_objects": result["detected_objects"],
-                })
- 
-            # Track peak threat frame
-            if result["threat_level"] > peak_threat or (
-                result["threat_level"] == peak_threat
-                and result["confidence"] > (peak_result or {}).get("confidence", 0)
-            ):
-                peak_threat = result["threat_level"]
-                peak_frame = frame.copy()
-                peak_result = {
-                    "threat_label": result["threat_label"],
-                    "threat_level": result["threat_level"],
-                    "confidence": result["confidence"],
-                    "probabilities": result["probabilities"],
-                    "scene_description": result.get("scene_description", ""),
-                    "gemini_description": result.get("scene_description", ""),  # legacy
-                    "reasoning": result.get("reasoning", ""),
-                    "detected_objects": result.get("detected_objects", []),
-                    "yolo_objects": result.get("detected_objects", []),  # legacy
-                    "provider_used": result.get("provider_used", "unknown"),
-                    "model": result.get("model", "unknown"),
-                    "inference_time_ms": result.get("inference_time_ms", 0),
-                }
- 
-        cap.release()
- 
-        if frames_analyzed == 0:
-            # Every analysis attempt failed — most likely quota exhausted
-            err_msg = (
-                "Gemini API quota exhausted (free tier is 15 RPM / ~1000 RPD). "
-                "Wait ~60s for the per-minute window to reset, or until tomorrow "
-                "for the daily quota."
-                if quota_hit
-                else "No frames could be analyzed"
-            )
-            return jsonify({
-                "success": False,
-                "data": None,
-                "error": err_msg,
-                "quota_hit": quota_hit,
-            }), 429 if quota_hit else 400
- 
-        if peak_result is None:
-            return jsonify({"success": False, "data": None, "error": "No frames could be analyzed"}), 400
- 
-        peak_result["total_frames"] = total_frames
-        peak_result["frames_analyzed"] = frames_analyzed
-        peak_result["frames_failed"] = frames_failed
-        peak_result["quota_hit"] = quota_hit
-        peak_result["threat_detections"] = len(all_detections)
- 
-        # Always send the peak frame back to the frontend so it can render the
-        # bounding-box overlay. (Independent of whether we saved an incident.)
-        if peak_frame is not None:
-            _, peak_buf = cv2.imencode(".jpg", peak_frame)
-            peak_result["peak_snapshot_b64"] = base64.b64encode(peak_buf).decode()
- 
-        # Save to database if threat detected
-        if peak_result["threat_level"] > 0 and peak_frame is not None:
-            _, snap_buf = cv2.imencode(".jpg", peak_frame)
-            incident = {
-                "agent_id": "video_upload",
-                "threat_label": peak_result["threat_label"],
-                "threat_level": peak_result["threat_level"],
-                "confidence": peak_result["confidence"],
-                "scene_description": peak_result["scene_description"],
-                "gemini_description": peak_result["scene_description"],  # legacy
-                "reasoning": peak_result["reasoning"],
-                "detected_objects": peak_result["detected_objects"],
-                "yolo_objects": peak_result["detected_objects"],  # legacy
-                "provider_used": peak_result["provider_used"],
-                "model": peak_result["model"],
-                "timestamp": datetime.now(timezone.utc),
-                "snapshot": base64.b64encode(snap_buf).decode(),
-                "acknowledged": False,
-                "source": "video_upload",
-                "filename": video_file.filename,
-            }
-            save_incident(incident)
- 
-            # Send email/SMS alert to the uploader for suspicious or critical threats.
-            # Run in background thread so notifications don't block the API response.
-            user = g.user
-            label = peak_result["threat_label"].upper()
-            conf = peak_result["confidence"]
-            reason = peak_result.get("reasoning", "")
-            alert_msg = (
-                f"[Falantir] {label} detected ({conf:.0%}) in uploaded video "
-                f"'{video_file.filename}'. {reason}"
-            )
-            alert_ctx = {
-                "threat_label": peak_result["threat_label"],
-                "confidence": peak_result["confidence"],
-                "reasoning": peak_result.get("reasoning", ""),
-                "scene_description": peak_result.get("scene_description", ""),
-                "source": f"Video upload: {video_file.filename}",
-                "timestamp": datetime.now(timezone.utc).strftime("%d %b %Y, %H:%M UTC"),
-                "snapshot_b64": peak_result.get("peak_snapshot_b64"),
-            }
-            threading.Thread(
-                target=notify_all,
-                args=(user.get("email"), user.get("phone"), alert_msg),
-                kwargs={"alert_context": alert_ctx},
-                daemon=True,
-            ).start()
- 
-        return jsonify({"success": True, "data": peak_result, "error": None})
- 
-    finally:
-        # Always delete temp file
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
+        # Port 465 = implicit SSL (Hostinger's recommended port); 587 = STARTTLS.
+        if int(SMTP_PORT) == 465:
+            server = smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT, timeout=20)
+        else:
+            server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=20)
+            server.starttls()
+        server.login(SMTP_USER, SMTP_PASS)
+        server.send_message(msg)
+        server.quit()
+        print(f"EMAIL SENT (SMTP {SMTP_SERVER}:{SMTP_PORT}): To {to_email}")
+        log_notification("email", to_email, "sent", detail=subject)
+        return True
+    except Exception as e:
+        print(f"EMAIL ERROR: {e}")
+        log_notification("email", to_email, "failed", detail=subject, error=e)
+        return False
  
  
-@detection_bp.route("/incidents", methods=["GET"])
-@login_required
-def get_incidents():
-    """Return paginated incident history."""
-    page = request.args.get("page", 1, type=int)
-    per_page = request.args.get("per_page", 20, type=int)
-    per_page = min(per_page, 100)
-    agent_id = request.args.get("agent_id")
+def send_sms(to_phone, message):
+    if not _HAS_TWILIO or not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN:
+        print(f"SMS SKIPPED (No credentials or twilio not installed): To {to_phone}")
+        log_notification("sms", to_phone, "skipped", detail=message, error="no Twilio credentials")
+        return False
  
-    query = {}
-    if agent_id:
-        query["agent_id"] = agent_id
- 
-    total = incidents_col().count_documents(query)
-    incidents = list(
-        incidents_col()
-        .find(query)
-        .sort("timestamp", -1)
-        .skip((page - 1) * per_page)
-        .limit(per_page)
-    )
- 
-    for inc in incidents:
-        inc["_id"] = str(inc["_id"])
-        if isinstance(inc.get("timestamp"), datetime):
-            inc["timestamp"] = inc["timestamp"].isoformat()
- 
-        # Back-compat: old records stored `yolo_objects`; new code expects
-        # `detected_objects`. Make both available either way.
-        if "detected_objects" not in inc and "yolo_objects" in inc:
-            inc["detected_objects"] = inc["yolo_objects"]
-        if "yolo_objects" not in inc and "detected_objects" in inc:
-            inc["yolo_objects"] = inc["detected_objects"]
-        if "scene_description" not in inc and "gemini_description" in inc:
-            inc["scene_description"] = inc["gemini_description"]
-        if "gemini_description" not in inc and "scene_description" in inc:
-            inc["gemini_description"] = inc["scene_description"]
- 
-    return jsonify({
-        "success": True,
-        "data": {
-            "incidents": incidents,
-            "total": total,
-            "page": page,
-            "per_page": per_page,
-        },
-        "error": None,
-    })
+    try:
+        client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+        client.messages.create(
+            body=message,
+            from_=TWILIO_PHONE_NUMBER,
+            to=to_phone
+        )
+        print(f"SMS SENT: To {to_phone}")
+        log_notification("sms", to_phone, "sent", detail=message)
+        return True
+    except Exception as e:
+        print(f"SMS ERROR: {e}")
+        log_notification("sms", to_phone, "failed", detail=message, error=e)
+        return False
  
  
-@detection_bp.route("/incidents/<incident_id>/acknowledge", methods=["POST"])
-@login_required
-def acknowledge_incident(incident_id):
-    """Mark an incident as acknowledged."""
-    if not ObjectId.is_valid(incident_id):
-        return jsonify({"success": False, "data": None, "error": "Invalid incident ID"}), 400
+def make_call(to_phone, message):
+    if not _HAS_TWILIO or not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN:
+        print(f"CALL SKIPPED (No credentials or twilio not installed): To {to_phone}")
+        log_notification("call", to_phone, "skipped", detail=message, error="no Twilio credentials")
+        return False
  
-    result = incidents_col().update_one(
-        {"_id": ObjectId(incident_id)},
-        {"$set": {"acknowledged": True, "acknowledged_at": datetime.now(timezone.utc)}},
-    )
- 
-    if result.matched_count == 0:
-        return jsonify({"success": False, "data": None, "error": "Incident not found"}), 404
- 
-    return jsonify({"success": True, "data": {"message": "Incident acknowledged"}, "error": None})
- 
- 
-@detection_bp.route("/feedback", methods=["POST"])
-@login_required
-def submit_feedback():
-    """Submit RL feedback on an incident (correct / false_positive)."""
-    data = request.get_json()
-    if not data:
-        return jsonify({"success": False, "data": None, "error": "Request body required"}), 400
- 
-    incident_id = data.get("incident_id", "")
-    verdict = data.get("verdict", "")  # "correct" or "false_positive"
-    correct_label = data.get("correct_label")  # If false_positive, what it should be
- 
-    if not incident_id or verdict not in ("correct", "false_positive"):
-        return jsonify({"success": False, "data": None, "error": "incident_id and verdict (correct/false_positive) required"}), 400
- 
-    feedback_doc = {
-        "incident_id": incident_id,
-        "user_id": g.user["_id"],
-        "verdict": verdict,
-        "correct_label": correct_label,
-        "timestamp": datetime.now(timezone.utc),
-    }
-    rl_feedback_col().insert_one(feedback_doc)
- 
-    return jsonify({"success": True, "data": {"message": "Feedback recorded"}, "error": None})
+    try:
+        client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+        twiml = f'<Response><Say>{message}</Say></Response>'
+        client.calls.create(
+            twiml=twiml,
+            from_=TWILIO_PHONE_NUMBER,
+            to=to_phone
+        )
+        print(f"CALL INITIATED: To {to_phone}")
+        log_notification("call", to_phone, "sent", detail=message)
+        return True
+    except Exception as e:
+        print(f"CALL ERROR: {e}")
+        log_notification("call", to_phone, "failed", detail=message, error=e)
+        return False
  
  
-@detection_bp.route("/stats", methods=["GET"])
-@login_required
-def get_stats():
-    """Return overall analytics stats."""
-    total_incidents = incidents_col().count_documents({})
-    critical = incidents_col().count_documents({"threat_label": "critical"})
-    suspicious = incidents_col().count_documents({"threat_label": "suspicious"})
- 
-    # Per-agent stats
-    pipeline = [
-        {"$group": {
-            "_id": "$agent_id",
-            "total": {"$sum": 1},
-            "avg_confidence": {"$avg": "$confidence"},
-            "last_active": {"$max": "$timestamp"},
-        }},
-    ]
-    agent_stats = list(incidents_col().aggregate(pipeline))
-    for s in agent_stats:
-        s["agent_id"] = s.pop("_id")
-        if isinstance(s.get("last_active"), datetime):
-            s["last_active"] = s["last_active"].isoformat()
-        s["avg_confidence"] = round(s.get("avg_confidence", 0), 4)
- 
-    return jsonify({
-        "success": True,
-        "data": {
-            "total_incidents": total_incidents,
-            "critical_count": critical,
-            "suspicious_count": suspicious,
-            "safe_count": total_incidents - critical - suspicious,
-            "agent_stats": agent_stats,
-        },
-        "error": None,
-    })
- 
- 
-@detection_bp.route("/analytics/daily", methods=["GET"])
-@login_required
-def daily_analytics():
-    """Return daily incident counts for the past 30 days."""
-    days = request.args.get("days", 30, type=int)
-    days = min(days, 90)
- 
-    from datetime import timedelta
-    since = datetime.now(timezone.utc) - timedelta(days=days)
- 
-    records = list(
-        analytics_col()
-        .find({"timestamp": {"$gte": since}})
-        .sort("date", 1)
-    )
- 
-    for r in records:
-        r["_id"] = str(r["_id"])
-        if isinstance(r.get("timestamp"), datetime):
-            r["timestamp"] = r["timestamp"].isoformat()
-        if isinstance(r.get("updated_at"), datetime):
-            r["updated_at"] = r["updated_at"].isoformat()
- 
-    return jsonify({"success": True, "data": records, "error": None})
- 
- 
-@detection_bp.route("/alert/manual", methods=["POST"])
-@login_required
-def manual_alert():
-    """Manually trigger an alert to all active users.
- 
-    Returns IMMEDIATELY and fans out email + Twilio SMS/call in a background
-    thread. Doing it synchronously made the request take 15s+ (each channel is
-    a network call, and a blocked SMTP attempt on the host hangs until timeout),
-    which caused the browser to abort the request (HTTP 499).
+def notify_all(user_email, user_phone, message, alert_context=None):
     """
-    data = request.get_json() or {}
-    message = data.get("message", "Manual security alert triggered from Falantir dashboard.")
+    Notify user via all available channels.
  
-    users = list(users_col().find({"is_active": True}))
+    If `alert_context` is supplied, the email is rendered as a branded
+    HTML alert with optional inline snapshot. The plain `message` is still
+    used for SMS (which has no HTML support and a 160-character limit).
+    """
+    # Fallback recipients: on the live deployment the register form does not
+    # collect a phone, so user records have an empty phone -> SMS/calls get
+    # silently skipped. Set ALERT_TO_NUMBER (and optionally ALERT_TO_EMAIL) in
+    # the environment to guarantee a recipient. On a Twilio trial the number
+    # must be verified.
+    user_phone = (user_phone or os.getenv("ALERT_TO_NUMBER", "")).strip()
+    user_email = (user_email or os.getenv("ALERT_TO_EMAIL", "")).strip()
  
-    def _dispatch(recipients, msg):
-        for u in recipients:
-            try:
-                notify_all(u.get("email"), u.get("phone"), msg)
-            except Exception as e:
-                print(f"MANUAL ALERT: notify failed for {u.get('email')}: {e}")
- 
-    threading.Thread(target=_dispatch, args=(users, message), daemon=True).start()
- 
-    return jsonify({
-        "success": True,
-        "data": {"message": "Alert dispatched", "recipients": len(users)},
-        "error": None,
-    }), 202
+    results = {}
+    # SMS/call first: they're the fast, critical channels. Email goes last so a
+    # slow or host-blocked SMTP attempt can't delay the SMS/call.
+    if user_phone:
+        results['sms'] = send_sms(user_phone, message)
+        results['call'] = make_call(user_phone, message)
+    if user_email:
+        if alert_context:
+            html, plain = _build_alert_email_html(alert_context)
+            threat_label = (alert_context.get("threat_label") or "suspicious").upper()
+            subject = f"Falantir Alert: {threat_label} activity detected"
+            results['email'] = send_email(
+                user_email,
+                subject,
+                plain,
+                html=html,
+                image_b64=alert_context.get("snapshot_b64"),
+            )
+        else:
+            results['email'] = send_email(user_email, "Falantir Security Alert", message)
+    return results
  
  
