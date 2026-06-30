@@ -10,26 +10,32 @@ try:
     _HAS_TWILIO = True
 except ImportError:
     _HAS_TWILIO = False
-
+ 
+try:
+    from api.database_v2 import log_notification
+except Exception:
+    def log_notification(*args, **kwargs):  # DB unavailable — best-effort
+        pass
+ 
 SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.gmail.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USER = os.getenv("SMTP_USER", "")
 SMTP_PASS = os.getenv("SMTP_PASS", "")
 FROM_EMAIL = os.getenv("FROM_EMAIL", SMTP_USER)
 DASHBOARD_URL = os.getenv("DASHBOARD_URL", "http://localhost:5173")
-
+ 
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
 TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER", "")
-
-
+ 
+ 
 _THREAT_COLORS = {
     "safe": "#22c55e",
     "suspicious": "#f59e0b",
     "critical": "#ef4444",
 }
-
-
+ 
+ 
 def _build_alert_email_html(ctx):
     """Render a branded HTML alert email. Returns (html, plain_fallback)."""
     threat_label = (ctx.get("threat_label") or "suspicious").lower()
@@ -48,7 +54,7 @@ def _build_alert_email_html(ctx):
         '</td></tr>'
         if has_snapshot else ''
     )
-
+ 
     html = f"""<!DOCTYPE html>
 <html>
 <head>
@@ -59,7 +65,7 @@ def _build_alert_email_html(ctx):
 <table cellpadding="0" cellspacing="0" border="0" width="100%" style="background-color:#f1f5f9;padding:24px 0;">
 <tr><td align="center">
 <table cellpadding="0" cellspacing="0" border="0" width="600" style="background-color:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,0.1);max-width:600px;">
-
+ 
 <tr>
 <td style="background-color:#0f172a;padding:24px 32px;color:#ffffff;">
 <table width="100%" cellpadding="0" cellspacing="0">
@@ -75,14 +81,14 @@ def _build_alert_email_html(ctx):
 </table>
 </td>
 </tr>
-
+ 
 <tr>
 <td style="padding:32px 32px 8px 32px;">
 <div style="font-size:12px;color:#64748b;font-weight:600;letter-spacing:1px;margin-bottom:8px;">DETECTED</div>
 <div style="font-size:22px;font-weight:700;color:#0f172a;line-height:1.3;">{threat_label.title()} activity ({confidence_pct}% confidence)</div>
 </td>
 </tr>
-
+ 
 <tr>
 <td style="padding:0 32px;">
 <table width="100%" cellpadding="0" cellspacing="0" style="margin-top:20px;border-top:1px solid #e2e8f0;">
@@ -97,14 +103,14 @@ def _build_alert_email_html(ctx):
 </table>
 </td>
 </tr>
-
+ 
 <tr>
 <td style="padding:24px 32px 0 32px;">
 <div style="font-size:12px;color:#64748b;font-weight:600;letter-spacing:1px;margin-bottom:8px;">SCENE DESCRIPTION</div>
 <div style="font-size:14px;color:#334155;line-height:1.6;font-style:italic;">{scene_description}</div>
 </td>
 </tr>
-
+ 
 <tr>
 <td style="padding:24px 32px 0 32px;">
 <div style="padding:16px;background-color:#fff7ed;border-left:4px solid {threat_color};border-radius:6px;">
@@ -113,9 +119,9 @@ def _build_alert_email_html(ctx):
 </div>
 </td>
 </tr>
-
+ 
 {snapshot_html}
-
+ 
 <tr>
 <td style="padding:24px 32px 32px 32px;">
 <table width="100%" cellpadding="0" cellspacing="0">
@@ -125,7 +131,7 @@ def _build_alert_email_html(ctx):
 </table>
 </td>
 </tr>
-
+ 
 <tr>
 <td style="background-color:#f8fafc;padding:20px 32px;border-top:1px solid #e2e8f0;">
 <div style="font-size:11px;color:#94a3b8;text-align:center;line-height:1.5;">
@@ -134,13 +140,13 @@ You are receiving this because your account is configured to receive security no
 </div>
 </td>
 </tr>
-
+ 
 </table>
 </td></tr>
 </table>
 </body>
 </html>"""
-
+ 
     plain = (
         f"FALANTIR SECURITY ALERT\n"
         f"=======================\n\n"
@@ -152,8 +158,8 @@ You are receiving this because your account is configured to receive security no
         f"View in dashboard: {DASHBOARD_URL}\n"
     )
     return html, plain
-
-
+ 
+ 
 def send_email(to_email, subject, body, html=None, image_b64=None):
     """
     Send an email. If `html` is provided, sends a multipart/alternative
@@ -163,8 +169,9 @@ def send_email(to_email, subject, body, html=None, image_b64=None):
     """
     if not SMTP_USER or not SMTP_PASS:
         print(f"EMAIL SKIPPED (No credentials): To {to_email}")
+        log_notification("email", to_email, "skipped", detail=subject, error="no SMTP credentials")
         return False
-
+ 
     try:
         if html:
             msg = MIMEMultipart("related")
@@ -190,7 +197,7 @@ def send_email(to_email, subject, body, html=None, image_b64=None):
             msg["To"] = to_email
             msg["Subject"] = subject
             msg.attach(MIMEText(body, "plain"))
-
+ 
         # Port 465 = implicit SSL (Hostinger's recommended port); 587 = STARTTLS.
         if int(SMTP_PORT) == 465:
             server = smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT, timeout=20)
@@ -201,17 +208,20 @@ def send_email(to_email, subject, body, html=None, image_b64=None):
         server.send_message(msg)
         server.quit()
         print(f"EMAIL SENT (SMTP {SMTP_SERVER}:{SMTP_PORT}): To {to_email}")
+        log_notification("email", to_email, "sent", detail=subject)
         return True
     except Exception as e:
         print(f"EMAIL ERROR: {e}")
+        log_notification("email", to_email, "failed", detail=subject, error=e)
         return False
-
-
+ 
+ 
 def send_sms(to_phone, message):
     if not _HAS_TWILIO or not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN:
         print(f"SMS SKIPPED (No credentials or twilio not installed): To {to_phone}")
+        log_notification("sms", to_phone, "skipped", detail=message, error="no Twilio credentials")
         return False
-
+ 
     try:
         client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
         client.messages.create(
@@ -220,17 +230,20 @@ def send_sms(to_phone, message):
             to=to_phone
         )
         print(f"SMS SENT: To {to_phone}")
+        log_notification("sms", to_phone, "sent", detail=message)
         return True
     except Exception as e:
         print(f"SMS ERROR: {e}")
+        log_notification("sms", to_phone, "failed", detail=message, error=e)
         return False
-
-
+ 
+ 
 def make_call(to_phone, message):
     if not _HAS_TWILIO or not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN:
         print(f"CALL SKIPPED (No credentials or twilio not installed): To {to_phone}")
+        log_notification("call", to_phone, "skipped", detail=message, error="no Twilio credentials")
         return False
-
+ 
     try:
         client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
         twiml = f'<Response><Say>{message}</Say></Response>'
@@ -240,16 +253,18 @@ def make_call(to_phone, message):
             to=to_phone
         )
         print(f"CALL INITIATED: To {to_phone}")
+        log_notification("call", to_phone, "sent", detail=message)
         return True
     except Exception as e:
         print(f"CALL ERROR: {e}")
+        log_notification("call", to_phone, "failed", detail=message, error=e)
         return False
-
-
+ 
+ 
 def notify_all(user_email, user_phone, message, alert_context=None):
     """
     Notify user via all available channels.
-
+ 
     If `alert_context` is supplied, the email is rendered as a branded
     HTML alert with optional inline snapshot. The plain `message` is still
     used for SMS (which has no HTML support and a 160-character limit).
@@ -261,8 +276,13 @@ def notify_all(user_email, user_phone, message, alert_context=None):
     # must be verified.
     user_phone = (user_phone or os.getenv("ALERT_TO_NUMBER", "")).strip()
     user_email = (user_email or os.getenv("ALERT_TO_EMAIL", "")).strip()
-
+ 
     results = {}
+    # SMS/call first: they're the fast, critical channels. Email goes last so a
+    # slow or host-blocked SMTP attempt can't delay the SMS/call.
+    if user_phone:
+        results['sms'] = send_sms(user_phone, message)
+        results['call'] = make_call(user_phone, message)
     if user_email:
         if alert_context:
             html, plain = _build_alert_email_html(alert_context)
@@ -277,7 +297,6 @@ def notify_all(user_email, user_phone, message, alert_context=None):
             )
         else:
             results['email'] = send_email(user_email, "Falantir Security Alert", message)
-    if user_phone:
-        results['sms'] = send_sms(user_phone, message)
-        results['call'] = make_call(user_phone, message)
     return results
+ 
+ 
