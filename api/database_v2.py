@@ -1,27 +1,27 @@
 """
 Falantir v2 — MongoDB database layer.
-
+ 
 Collections: users, agents, incidents, analytics, rl_feedback
 Uses PyMongo (sync) for Flask compatibility.
 """
-
+ 
 import os
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 from pymongo import MongoClient, ASCENDING, DESCENDING
-
+ 
 load_dotenv()
-
+ 
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017/")
 DATABASE_NAME = "falantir"
-
+ 
 _client = None
 _db = None
-
-
+ 
+ 
 def get_db():
     """Get the database instance, connecting if needed.
-
+ 
     TLS is only enabled for remote / Atlas connections. Local dev instances
     (mongodb://localhost/, 127.0.0.1/, plain hostnames) use an unencrypted
     connection, because forcing TLS on a non-TLS local mongod crashes the
@@ -37,12 +37,12 @@ def get_db():
         )
         is_srv = uri_lower.startswith("mongodb+srv://")
         use_tls = is_srv or (not is_local)
-
+ 
         kwargs = {"serverSelectionTimeoutMS": 5000}
         if use_tls:
             import certifi
             kwargs["tlsCAFile"] = certifi.where()
-
+ 
         try:
             _client = MongoClient(MONGO_URI, **kwargs)
             _db = _client[DATABASE_NAME]
@@ -54,34 +54,38 @@ def get_db():
             print(f"DATABASE CONNECTION ERROR: {e}")
             raise e
     return _db
-
-
+ 
+ 
 def init_db():
     """Create indexes on startup."""
     db = get_db()
-
+ 
     # Users
     db.users.create_index("email", unique=True)
-
+ 
     # Agents
     db.agents.create_index("name")
     db.agents.create_index("created_at")
-
+ 
     # Incidents
     db.incidents.create_index([("timestamp", DESCENDING)])
     db.incidents.create_index("agent_id")
     db.incidents.create_index("threat_label")
-
+ 
     # Analytics
     db.analytics.create_index([("agent_id", ASCENDING), ("date", ASCENDING)], unique=True)
-
+ 
     # RL Feedback
     db.rl_feedback.create_index("incident_id")
     db.rl_feedback.create_index([("timestamp", DESCENDING)])
-
+ 
+    # Notification logs (one record per email/SMS/call attempt)
+    db.notification_logs.create_index([("timestamp", DESCENDING)])
+    db.notification_logs.create_index("channel")
+ 
     print(f"DATABASE: Connected to {MONGO_URI} — db: {DATABASE_NAME}")
-
-
+ 
+ 
 def close_db():
     """Close MongoDB connection."""
     global _client, _db
@@ -89,28 +93,53 @@ def close_db():
         _client.close()
         _client = None
         _db = None
-
-
+ 
+ 
 # ─── Collection Accessors ─────────────────────────────────
-
+ 
 def users_col():
     return get_db().users
-
+ 
 def agents_col():
     return get_db().agents
-
+ 
 def incidents_col():
     return get_db().incidents
-
+ 
 def analytics_col():
     return get_db().analytics
-
+ 
 def rl_feedback_col():
     return get_db().rl_feedback
-
-
+ 
+def notification_logs_col():
+    return get_db().notification_logs
+ 
+ 
+# ─── Notification Log Helper ──────────────────────────────
+ 
+def log_notification(channel, to, status, detail=None, error=None):
+    """Record one notification attempt. Never raises — logging must not break
+    the actual send.
+      channel: 'email' | 'sms' | 'call'
+      status:  'sent'  | 'failed' | 'skipped'
+      detail:  subject (email) or message text (sms/call)
+    """
+    try:
+        notification_logs_col().insert_one({
+            "channel": channel,
+            "to": to,
+            "status": status,
+            "detail": detail,
+            "error": str(error) if error else None,
+            "timestamp": datetime.now(timezone.utc),
+        })
+    except Exception as e:
+        print(f"DB ERROR (log_notification): {e}")
+ 
+ 
 # ─── Incident Helpers ─────────────────────────────────────
-
+ 
 def save_incident(incident_data):
     """Save an incident to MongoDB. Called from background thread."""
     try:
@@ -119,8 +148,8 @@ def save_incident(incident_data):
         incidents_col().insert_one(incident_data)
     except Exception as e:
         print(f"DB ERROR (save_incident): {e}")
-
-
+ 
+ 
 def update_daily_analytics(agent_id, threat_label):
     """Increment daily analytics counters for an agent."""
     try:
@@ -143,3 +172,5 @@ def update_daily_analytics(agent_id, threat_label):
         )
     except Exception as e:
         print(f"DB ERROR (analytics): {e}")
+ 
+ 
